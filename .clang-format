@@ -1,0 +1,10 @@
+BasedOnStyle: LLVM
+IndentWidth: 4
+BreakBeforeBraces: Linux
+AllowShortFunctionsOnASingleLine: None
+InsertBraces: true
+NumericLiteralCase:
+  ExponentLetter: Lower
+  HexDigit: Lower
+  Prefix: Lower
+  Suffix: Upper

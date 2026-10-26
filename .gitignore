@@ -1,0 +1,9 @@
+/build/
+/tools/llvm/
+/tools/__pycache__/
+
+# compiler texts and what asmsh makes of them stay out, wherever they land.
+# the tests write their own
+*.src
+*.lst
+*.obj

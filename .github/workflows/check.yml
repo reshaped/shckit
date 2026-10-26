@@ -1,0 +1,36 @@
+name: check
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - run: make CC=${{ matrix.cc }}
+      - run: make test CC=${{ matrix.cc }}
+
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - run: make lint
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - run: make fuzz

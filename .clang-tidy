@@ -1,0 +1,33 @@
+Checks:
+  - -*
+  - clang-analyzer-*
+  - clang-diagnostic-*
+  - bugprone-*
+  - misc-*
+  - readability-*
+  # adjacent parameters often share a type, such as a line and its length
+  - -bugprone-easily-swappable-parameters
+  # keep each pass over a text, a section's flow and the fuzzer's checks
+  # among them, in one loop
+  - -readability-function-cognitive-complexity
+  # C logical operators and conditional expressions use integer truth values
+  - -readability-implicit-bool-conversion
+  # encodings, sizes and columns are meaningful at their use sites
+  - -readability-magic-numbers
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*'
+CheckOptions:
+  readability-identifier-naming.FunctionCase: lower_case
+  readability-identifier-naming.VariableCase: lower_case
+  readability-identifier-naming.ParameterCase: lower_case
+  readability-identifier-naming.MemberCase: lower_case
+  readability-identifier-naming.StructCase: lower_case
+  readability-identifier-naming.UnionCase: lower_case
+  readability-identifier-naming.EnumCase: lower_case
+  readability-identifier-naming.EnumConstantCase: UPPER_CASE
+  readability-identifier-naming.MacroDefinitionCase: UPPER_CASE
+  readability-identifier-naming.TypedefCase: lower_case
+  readability-identifier-length.MinimumVariableNameLength: 2
+  readability-identifier-length.MinimumParameterNameLength: 2
+  readability-identifier-length.IgnoredVariableNames: '^[ijkxyz]$'
+  readability-identifier-length.IgnoredParameterNames: '^[ijkxyz]$'
