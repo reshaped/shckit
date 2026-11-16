@@ -5,7 +5,7 @@
 shckit grew out of decompiling Dreamcast games:
 
 - **Patch** SHC's output minimally, with targeted, deterministic rules, to rebuild specific SDK library members.
-- **Inspect** an assembly function for evidence that a specified SHC release didn't compile it from C, inline assembly aside.
+- **Inspect** an assembly function for a pattern no Dreamcast SHC compiler is known to write from C, inline assembly aside.
 - **Check** assembly for instructions the opcode table doesn't hold and for control-flow hazards.
 - **Lint** asmsh assembly: the format is old, and decomp projects need a modern tool to keep their source formatted.
 - **Translate** asmsh assembly to GNU as text that binutils assembles to asmsh's bytes, within stated limits, so a build can leave Hitachi's assembler out.
@@ -25,7 +25,7 @@ The executable is `build/shckit`. GCC and Clang are supported. The library uses 
 build/shckit apply -p PATCH ... -o OUT IN
 build/shckit check FILE...
 build/shckit lint FILE...
-build/shckit inspect --release RELEASE --mode MODE --entry LABEL [--end LABEL] [--sz 0|1] [--all] FILE
+build/shckit inspect --entry LABEL [--end LABEL] [--sz 0|1] [--all] FILE
 build/shckit translate -o OUT IN
 ```
 
@@ -44,13 +44,13 @@ asmsh patched.src -object=patched.obj -cpu=sh4 -endian=little -sjis -private
 
 [`check`](docs/check.md) refuses lines asmsh may not assemble as written, or the SH-4 may not run as they read. A text it passes can still fail in asmsh, or run otherwise than it reads. [`lint`](docs/lint.md) holds the text people write to a consistent layout. Both name every line they refuse, and change nothing.
 
-[`inspect`](docs/inspect.md) looks in one function for an instruction, operands or a use of R15 that is evidence the release named didn't compile it from C. It prints the witness, or `none`, and any limit it met, a place it couldn't see past:
+[`inspect`](docs/inspect.md) looks in one function for an instruction, operands or a use of R15 that no Dreamcast SHC compiler is known to write from C. It asks about them as a family, so it takes no release. It prints the witness, or `none`, and any limit it met, a place it couldn't see past:
 
 ```
-x.src:3: _f: abi: stack-above-entry (SP +8)
+x.src:3: _f: abi: return-above-entry (SP +8)
 ```
 
-`stack-above-entry` and `return-below-entry` rest on an [unfinished argument](docs/inspect.md#abi-rules) about SHC 5.0 R10's frames.
+"Not known" is the claim: [each rule's evidence](docs/inspect.md#evidence) says what was read for which release and what is inference. `return-above-entry` and `return-below-entry` rest on an [unfinished argument](docs/inspect.md#abi-rules) about SHC 5.0 R10's frames, and on compiles alone for every other release. `integer-constant`, which reads how a constant's register is used, rests on compiles but for R10's expansion of constants.
 
 inspect doesn't find where a function ends. Without `--end` it reads to the end of the entry's `.SECTION` block, so give `--end` when another function follows. `none` means no witness, not that SHC compiled the function from C.
 

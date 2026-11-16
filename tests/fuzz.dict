@@ -98,3 +98,6 @@
 "DR10"
 "STS.L       FPSCR,@-R15"
 "LDS.L       @R15+,FPSCR"
+"          .DATA.L     H'00000080"
+"DT          R7"
+"LDS         R1,FPUL"

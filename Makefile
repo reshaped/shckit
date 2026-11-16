@@ -118,50 +118,43 @@ test: build/test/test build/test/shckit
 # inspect prints a witness, or with --all every witness, or none, and any
 # limit, exiting 3 for a limit. a function without --end runs to the end of
 # its .SECTION block, and a text check refuses gets check's findings
-	build/test/shckit inspect --release 5.0R10 --mode asmcode \
-		--entry _entry --end _end $(SAMPLE).returns > $(SAMPLE).inspecting
+	build/test/shckit inspect --entry _entry --end _end $(SAMPLE).returns \
+		> $(SAMPLE).inspecting
 	cmp $(SAMPLE).returned $(SAMPLE).inspecting
-	build/test/shckit inspect --end _end --entry _entry --mode both \
-		--release 5.0R10 $(SAMPLE).calls > $(SAMPLE).inspecting; \
-		[ $$? -eq 3 ]
+	build/test/shckit inspect --end _end --entry _entry $(SAMPLE).calls \
+		> $(SAMPLE).inspecting; [ $$? -eq 3 ]
 	cmp $(SAMPLE).called $(SAMPLE).inspecting
-	build/test/shckit inspect --release 5.0R10 --mode machinecode \
-		--entry _entry $(SAMPLE).loads > $(SAMPLE).inspecting
+	build/test/shckit inspect --entry _entry $(SAMPLE).loads \
+		> $(SAMPLE).inspecting
 	cmp $(SAMPLE).constant $(SAMPLE).inspecting
-	build/test/shckit inspect --release 5.0R32 --mode asmcode \
-		--entry _entry $(SAMPLE).loads > $(SAMPLE).inspecting; \
-		[ $$? -eq 3 ]
-	cmp $(SAMPLE).scoped $(SAMPLE).inspecting
-	build/test/shckit inspect --release 5.0R10 --mode asmcode \
-		--entry _entry $(SAMPLE).blocks > $(SAMPLE).inspecting; \
-		[ $$? -eq 3 ]
+	build/test/shckit inspect --entry _entry $(SAMPLE).blocks \
+		> $(SAMPLE).inspecting; [ $$? -eq 3 ]
 	cmp $(SAMPLE).fell $(SAMPLE).inspecting
-	build/test/shckit inspect --release 5.0R10 --mode asmcode \
-		--entry _entry $(SAMPLE).last > $(SAMPLE).inspecting
+	build/test/shckit inspect --entry _entry $(SAMPLE).last \
+		> $(SAMPLE).inspecting
 	cmp $(SAMPLE).lasted $(SAMPLE).inspecting
-	build/test/shckit inspect --release 5.0R10 --mode asmcode --all \
-		--entry _entry $(SAMPLE).witnesses > $(SAMPLE).inspecting; \
-		[ $$? -eq 3 ]
+	build/test/shckit inspect --all --entry _entry $(SAMPLE).witnesses \
+		> $(SAMPLE).inspecting; [ $$? -eq 3 ]
 	cmp $(SAMPLE).witnessed $(SAMPLE).inspecting
-	build/test/shckit inspect --all --all --release 5.0R10 --mode asmcode \
-		--entry _entry $(SAMPLE).witnesses 2> /dev/null; [ $$? -eq 2 ]
-	build/test/shckit inspect --release 5.0R10 --mode asmcode --entry _f \
-		--end _f $(SAMPLE).flawed 2> $(SAMPLE).checking; [ $$? -eq 1 ]
+	build/test/shckit inspect --all --all --entry _entry \
+		$(SAMPLE).witnesses 2> /dev/null; [ $$? -eq 2 ]
+	build/test/shckit inspect --entry _f --end _f $(SAMPLE).flawed \
+		2> $(SAMPLE).checking; [ $$? -eq 1 ]
 	cmp $(SAMPLE).checked $(SAMPLE).checking
 	for label in _none _end; do \
-		build/test/shckit inspect --release 5.0R10 --mode asmcode \
-			--entry $$label --end _end $(SAMPLE).returns 2> /dev/null; \
+		build/test/shckit inspect --entry $$label --end _end \
+			$(SAMPLE).returns 2> /dev/null; \
 		[ $$? -eq 2 ] || exit 1; \
 	done
-	build/test/shckit inspect --release 5.0R10 --mode asmcode --sz 2 \
-		--entry _entry --end _end $(SAMPLE).returns 2> /dev/null; \
-		[ $$? -eq 2 ]
-	build/test/shckit inspect --release 5.0R10 --mode asmcode \
-		--entry _entry --end _end build/test/none.src 2> /dev/null; \
-		[ $$? -eq 2 ]
-	[ ! -c /dev/full ] || { build/test/shckit inspect --release 5.0R10 \
-		--mode asmcode --entry _entry --end _end $(SAMPLE).returns \
-		> /dev/full 2> /dev/null; [ $$? -eq 2 ]; }
+	build/test/shckit inspect --sz 2 --entry _entry --end _end \
+		$(SAMPLE).returns 2> /dev/null; [ $$? -eq 2 ]
+	build/test/shckit inspect --release 5.1R13 --entry _entry --end _end \
+		$(SAMPLE).returns 2> /dev/null; [ $$? -eq 2 ]
+	build/test/shckit inspect --entry _entry --end _end build/test/none.src \
+		2> /dev/null; [ $$? -eq 2 ]
+	[ ! -c /dev/full ] || { build/test/shckit inspect --entry _entry \
+		--end _end $(SAMPLE).returns > /dev/full 2> /dev/null; \
+		[ $$? -eq 2 ]; }
 # translate writes GNU as text, or refuses a text naming its line, and an
 # OUT that names IN, a -p and a missing -o fail before IN is read
 	build/test/shckit translate -o $(SAMPLE).s $(SAMPLE).translate

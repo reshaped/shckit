@@ -235,46 +235,38 @@ static void linted(const struct shckit_text *text)
     free(found);
 }
 
-// The releases a rule holds for, by bit, as far as the producers inspected()
-// tries tell them apart: 5.0 R10, 5.0 R32, and each 5.0 and 5.1 release.
-enum { R10 = 1, R32 = 2, FIVES = 4 };
-
 // Each witness inspect's rules find, with the mnemonics it can stand at, or
-// NULL for any, and the releases its row in docs/inspect.md names under
-// each mode; and each limit, but instruction-effect: every instruction in the
-// opcode table has an effect the stack rule knows.
+// NULL for any; and each limit, but instruction-effect: every instruction in
+// the opcode table has an effect the stack rule knows.
 static const struct {
     const char *rule;
     const char *names;
     int kind;
-    unsigned machinecode;
-    unsigned asmcode;
 } witnesses[] = {
-    {"rotcl", "ROTCL", SHCKIT_OPCODE, FIVES, R10 | R32},
-    {"rotcr", "ROTCR", SHCKIT_OPCODE, FIVES, R10 | R32},
-    {"swap", "SWAP", SHCKIT_OPCODE, FIVES, R10 | R32},
-    {"dmuls", "DMULS", SHCKIT_OPCODE, FIVES, FIVES},
-    {"dmulu", "DMULU", SHCKIT_OPCODE, FIVES, FIVES},
-    {"movca", "MOVCA", SHCKIT_OPCODE, R10 | R32, R10 | R32},
-    {"fschg", "FSCHG", SHCKIT_OPCODE, R32, R32},
-    {"cache-line", "OCBI OCBP OCBWB", SHCKIT_OPCODE, R10 | R32, R10 | R32},
-    {"sett", "SETT", SHCKIT_OPCODE, R10 | R32, R10 | R32},
-    {"fipr-registers", "FIPR", SHCKIT_OPERAND, R10 | R32, R10 | R32},
-    {"ftrv-registers", "FTRV", SHCKIT_OPERAND, R10 | R32, R10 | R32},
-    {"fsca-registers", "FSCA", SHCKIT_OPERAND, R10, R10},
-    {"small-constant", "MOV", SHCKIT_OPERAND, R10, R10},
-    {"zero-displacement", "MOV", SHCKIT_OPERAND, R10 | R32, R10 | R32},
-    {"fschg-pairs", "FMOV", SHCKIT_OPERAND, R10, R10},
-    {"stack-written", NULL, SHCKIT_ABI, R10 | R32, R10 | R32},
-    {"fpscr-save", "STS LDS", SHCKIT_ABI, R10, R10},
-    {"stack-above-entry", NULL, SHCKIT_ABI, R10, R10},
-    {"return-below-entry", NULL, SHCKIT_ABI, R10, R10},
+    {"rotcl", "ROTCL", SHCKIT_OPCODE},
+    {"rotcr", "ROTCR", SHCKIT_OPCODE},
+    {"swap", "SWAP", SHCKIT_OPCODE},
+    {"dmuls", "DMULS", SHCKIT_OPCODE},
+    {"dmulu", "DMULU", SHCKIT_OPCODE},
+    {"movca", "MOVCA", SHCKIT_OPCODE},
+    {"cache-line", "OCBI OCBP OCBWB", SHCKIT_OPCODE},
+    {"sett", "SETT", SHCKIT_OPCODE},
+    {"fipr-registers", "FIPR", SHCKIT_OPERAND},
+    {"ftrv-registers", "FTRV", SHCKIT_OPERAND},
+    {"fsca-registers", "FSCA", SHCKIT_OPERAND},
+    {"small-constant", "MOV", SHCKIT_OPERAND},
+    {"integer-constant", "MOV", SHCKIT_OPERAND},
+    {"zero-displacement", "MOV", SHCKIT_OPERAND},
+    {"fschg-pairs", "FMOV", SHCKIT_OPERAND},
+    {"stack-written", NULL, SHCKIT_ABI},
+    {"fpscr-save", "STS LDS", SHCKIT_ABI},
+    {"return-above-entry", NULL, SHCKIT_ABI},
+    {"return-below-entry", NULL, SHCKIT_ABI},
 };
 static const char *const limits[] = {
-    "producer-scope",  "abi-scope",      "rule-scope",         "call",
-    "opaque-transfer", "branch-target",  "entered-delay-slot", "delay-slot",
-    "data-flow",       "section-change", "assembler-layout",   "continued",
-    "fallthrough",     "stack-unknown",  "pool-word",
+    "call",       "opaque-transfer", "branch-target",  "entered-delay-slot",
+    "delay-slot", "data-flow",       "section-change", "assembler-layout",
+    "continued",  "fallthrough",     "stack-unknown",  "pool-word",
 };
 
 static bool mnemonic_in(const struct shckit_line *line, const char *names)
@@ -351,62 +343,46 @@ static bool witnessed(const struct shckit_text *text,
 static bool limited(const struct shckit_function *function,
                     const struct shckit_inspection *result)
 {
-    // whether the limit is none, or one inspect names: the first two, a
-    // scope's, at no line, and any other at a line of the function
+    // whether the limit is none, or one inspect names at a line of the
+    // function
     if (result->incomplete == NULL) {
         return result->incomplete_index == SIZE_MAX;
     }
     for (size_t i = 0; i < sizeof limits / sizeof limits[0]; i++) {
         if (strcmp(result->incomplete, limits[i]) == 0) {
-            return i < 2 ? result->incomplete_index == SIZE_MAX
-                         : result->incomplete_index >= function->first &&
-                               result->incomplete_index < function->end;
+            return result->incomplete_index >= function->first &&
+                   result->incomplete_index < function->end;
         }
     }
     return false;
 }
 
-static bool named(const struct shckit_witness *witness,
-                  const struct shckit_producer *producer)
+static bool named(const struct shckit_witness *witness)
 {
-    // whether the witness's rule holds for the release and every mode asked,
-    // and the witness names what its rule does: R15's offset above the
-    // entry, or below it after a return, a constant from -128 to 127, or
-    // nothing
-    unsigned releases = 0;
-    size_t rule = 0;
-    if (strcmp(producer->release, "5.0R10") == 0) {
-        releases = R10 | FIVES;
-    } else if (strcmp(producer->release, "5.0R32") == 0) {
-        releases = R32 | FIVES;
-    } else if (strcmp(producer->release, "5.1R13") == 0) {
-        releases = FIVES;
-    }
+    // whether the witness names what its rule does: R15's offset above the
+    // entry, or below it after a return, a constant from -128 to -1, one from
+    // -32768 to 32767 outside it, or nothing
     if (witness->kind == SHCKIT_NO_WITNESS) {
         return witness->value == 0;
     }
-    rule = rule_of(witness->rule);
-    if (((producer->modes & SHCKIT_MACHINECODE) != 0 &&
-         (witnesses[rule].machinecode & releases) == 0) ||
-        ((producer->modes & SHCKIT_ASMCODE) != 0 &&
-         (witnesses[rule].asmcode & releases) == 0)) {
-        return false;
-    }
-    if (strcmp(witness->rule, "stack-above-entry") == 0) {
+    if (strcmp(witness->rule, "return-above-entry") == 0) {
         return witness->value > 0;
     }
     if (strcmp(witness->rule, "return-below-entry") == 0) {
         return witness->value < 0;
     }
     if (strcmp(witness->rule, "small-constant") == 0) {
-        return witness->value >= -128 && witness->value <= 127;
+        return witness->value >= -128 && witness->value <= -1;
+    }
+    if (strcmp(witness->rule, "integer-constant") == 0) {
+        return witness->value >= -32768 && witness->value <= 32767 &&
+               (witness->value < -128 || witness->value > -1);
     }
     return witness->value == 0;
 }
 
 static bool sound(const struct shckit_text *text,
                   const struct shckit_function *function,
-                  const struct shckit_producer *producer,
                   const struct shckit_inspection *result)
 {
     // a witness its rule allows, naming what named() allows, and a limit
@@ -417,12 +393,11 @@ static bool sound(const struct shckit_text *text,
             : witness->rule == NULL || !witnessed(text, function, witness)) {
         return false;
     }
-    return named(witness, producer) && limited(function, result);
+    return named(witness) && limited(function, result);
 }
 
 static bool all_sound(const struct shckit_text *text,
-                      const struct shckit_function *function,
-                      const struct shckit_producer *producer, int error,
+                      const struct shckit_function *function, int error,
                       const struct shckit_inspection *result)
 {
     // whether shckit_inspect_all returns what shckit_inspect did, error and
@@ -433,15 +408,14 @@ static bool all_sound(const struct shckit_text *text,
     struct shckit_witness *found = NULL;
     size_t count = 0;
     size_t first = 0;
-    bool ok = shckit_inspect_all(text, producer, function, &all, &found,
-                                 &count) == error &&
-              same_inspection(&all, result) &&
-              (count == 0) == (result->witness.kind == SHCKIT_NO_WITNESS) &&
-              (count == 0) == (found == NULL);
+    bool ok =
+        shckit_inspect_all(text, function, &all, &found, &count) == error &&
+        same_inspection(&all, result) &&
+        (count == 0) == (result->witness.kind == SHCKIT_NO_WITNESS) &&
+        (count == 0) == (found == NULL);
     for (size_t i = 0; ok && i < count; i++) {
         ok = found[i].kind != SHCKIT_NO_WITNESS && found[i].rule != NULL &&
-             witnessed(text, function, &found[i]) &&
-             named(&found[i], producer) &&
+             witnessed(text, function, &found[i]) && named(&found[i]) &&
              (i == 0 || found[i - 1].index < found[i].index ||
               (found[i - 1].index == found[i].index &&
                rule_of(found[i - 1].rule) < rule_of(found[i].rule)));
@@ -459,7 +433,7 @@ static bool all_sound(const struct shckit_text *text,
 static bool rests_on_sz(const struct shckit_witness *witness)
 {
     // whether the witness names R15's offset, which an FMOV moves by SZ
-    return strcmp(witness->rule, "stack-above-entry") == 0 ||
+    return strcmp(witness->rule, "return-above-entry") == 0 ||
            strcmp(witness->rule, "return-below-entry") == 0;
 }
 
@@ -488,8 +462,7 @@ static const struct shckit_witness *partner(const struct shckit_witness *list,
 }
 
 static bool both_sz(const struct shckit_text *text,
-                    const struct shckit_function *function,
-                    const struct shckit_producer *producer)
+                    const struct shckit_function *function)
 {
     // whether inspect, with SZ unknown, finds what SZ 0 and SZ 1 both find:
     // each witness of a rule that doesn't rest on SZ under both, and of one
@@ -505,11 +478,11 @@ static bool both_sz(const struct shckit_text *text,
     size_t counts[2] = {0, 0};
     size_t kept = 0;
     size_t lone = SIZE_MAX;
-    bool ok = shckit_inspect_all(text, producer, function, &result, &found,
-                                 &count) == SHCKIT_OK;
+    bool ok = shckit_inspect_all(text, function, &result, &found, &count) ==
+              SHCKIT_OK;
     for (int i = 0; ok && i < 2; i++) {
         under.sz = i == 0 ? SHCKIT_SZ_0 : SHCKIT_SZ_1;
-        ok = shckit_inspect_all(text, producer, &under, &runs[i], &lists[i],
+        ok = shckit_inspect_all(text, &under, &runs[i], &lists[i],
                                 &counts[i]) == SHCKIT_OK;
     }
     for (size_t i = 0; ok && i < counts[0]; i++) {
@@ -553,7 +526,6 @@ static bool both_sz(const struct shckit_text *text,
 }
 
 static void inspected_over(const struct shckit_text *text,
-                           const struct shckit_producer *producer,
                            const struct shckit_function *function, bool refused)
 {
     // abort unless inspect over function fails exactly when check refused
@@ -562,8 +534,8 @@ static void inspected_over(const struct shckit_text *text,
     // with SZ unknown what both_sz() allows
     struct shckit_inspection result;
     struct shckit_inspection again;
-    int error = shckit_inspect(text, producer, function, &result);
-    if (shckit_inspect(text, producer, function, &again) != error ||
+    int error = shckit_inspect(text, function, &result);
+    if (shckit_inspect(text, function, &again) != error ||
         !same_inspection(&result, &again) ||
         (error != SHCKIT_OK && error != SHCKIT_CHECK_FAILED) ||
         (error == SHCKIT_CHECK_FAILED) != refused) {
@@ -572,33 +544,25 @@ static void inspected_over(const struct shckit_text *text,
     if (error != SHCKIT_OK ? result.witness.kind != SHCKIT_NO_WITNESS ||
                                  result.incomplete != NULL ||
                                  result.incomplete_index != SIZE_MAX
-                           : !sound(text, function, producer, &result)) {
+                           : !sound(text, function, &result)) {
         abort();
     }
-    if (!all_sound(text, function, producer, error, &result)) {
+    if (!all_sound(text, function, error, &result)) {
         abort();
     }
     if (error == SHCKIT_OK && function->sz == SHCKIT_SZ_UNKNOWN &&
-        !both_sz(text, function, producer)) {
+        !both_sz(text, function)) {
         abort();
     }
 }
 
 static void inspected(const struct shckit_text *text)
 {
-    // inspected_over, from each of the first few labels in code under a few
-    // producers and each sz, to the next label, and to the end of its
-    // .SECTION block, as the command reads without --end, so that a branch
-    // to a label inside the function joins its paths
-    static const struct shckit_producer producers[] = {
-        {"5.0R10", SHCKIT_ASMCODE},
-        {"5.0R10", SHCKIT_MACHINECODE | SHCKIT_ASMCODE},
-        {"5.0R10", SHCKIT_MACHINECODE},
-        {"5.0R32", SHCKIT_ASMCODE},
-        {"5.1R13", SHCKIT_MACHINECODE},
-        {"6.0AD", SHCKIT_ASMCODE},
-    };
-    const size_t kinds = sizeof producers / sizeof producers[0];
+    // inspected_over, from each of the first few labels in code under each
+    // sz, to the next label, and to the end of its .SECTION block, as the
+    // command reads without --end, so that a branch to a label inside the
+    // function joins its paths
+    enum { LABELS = 6 };
     struct shckit_finding *found = NULL;
     size_t count = 0;
     size_t tried = 0;
@@ -606,7 +570,7 @@ static void inspected(const struct shckit_text *text)
         abort();
     }
     free(found);
-    for (size_t i = 0; i < shckit_count(text) && tried < kinds; i++) {
+    for (size_t i = 0; i < shckit_count(text) && tried < LABELS; i++) {
         const struct shckit_line *line = shckit_line(text, i);
         struct shckit_function function = {i, i + 1, (int)(tried % 3)};
         struct shckit_function block = function;
@@ -623,9 +587,9 @@ static void inspected(const struct shckit_text *text)
                shckit_line(text, block.end)->directive != SHCKIT_END) {
             block.end++;
         }
-        inspected_over(text, &producers[tried], &function, count != 0);
+        inspected_over(text, &function, count != 0);
         if (block.end != function.end) {
-            inspected_over(text, &producers[tried], &block, count != 0);
+            inspected_over(text, &block, count != 0);
         }
         tried++;
     }

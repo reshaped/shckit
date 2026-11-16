@@ -2674,15 +2674,10 @@ static void test_patch_names(void)
           0);
 }
 
-// A function _f, and inspecting one as 5.0 R10's -code=asmcode with SZ
-// unknown. R32 is the other release some rules hold for.
-#define R10 "5.0R10"
-#define R32 "5.0R32"
-#define ASM SHCKIT_ASMCODE
-#define OBJ SHCKIT_MACHINECODE
+// A function _f, and inspecting one with SZ unknown.
 #define UNKNOWN SHCKIT_SZ_UNKNOWN
 #define F(body) "_f:\n" body
-#define INSPECTS(body, want) inspects(F(body), R10, ASM, UNKNOWN, want)
+#define INSPECTS(body, want) inspects(F(body), UNKNOWN, want)
 
 static bool same_witness(const struct shckit_witness *one,
                          const struct shckit_witness *two)
@@ -2716,7 +2711,8 @@ static void describe(const struct shckit_text *text,
     if (witness->kind == SHCKIT_ABI && witness->value != 0) {
         (void)snprintf(got + len, size - len, " %+ld", (long)witness->value);
     } else if (witness->kind == SHCKIT_OPERAND &&
-               strcmp(witness->rule, "small-constant") == 0) {
+               (strcmp(witness->rule, "small-constant") == 0 ||
+                strcmp(witness->rule, "integer-constant") == 0)) {
         (void)snprintf(got + len, size - len, " #%ld", (long)witness->value);
     }
 }
@@ -2738,7 +2734,6 @@ static void describe_limit(const struct shckit_text *text,
 }
 
 static bool all_agree(const struct shckit_text *text,
-                      const struct shckit_producer *producer,
                       const struct shckit_function *function,
                       const struct shckit_inspection *result)
 {
@@ -2748,10 +2743,10 @@ static bool all_agree(const struct shckit_text *text,
     struct shckit_witness *found = NULL;
     size_t count = 0;
     size_t first = 0;
-    bool ok = shckit_inspect_all(text, producer, function, &all, &found,
-                                 &count) == SHCKIT_OK &&
-              same_inspection(&all, result) &&
-              (count == 0) == (result->witness.kind == SHCKIT_NO_WITNESS);
+    bool ok =
+        shckit_inspect_all(text, function, &all, &found, &count) == SHCKIT_OK &&
+        same_inspection(&all, result) &&
+        (count == 0) == (result->witness.kind == SHCKIT_NO_WITNESS);
     for (size_t i = 1; ok && i < count; i++) {
         if (found[i].kind < found[first].kind ||
             (found[i].kind == found[first].kind &&
@@ -2764,8 +2759,7 @@ static bool all_agree(const struct shckit_text *text,
     return ok;
 }
 
-static bool inspects_lines(const char *in, size_t first, size_t end,
-                           const char *release, unsigned modes, int sz,
+static bool inspects_lines(const char *in, size_t first, size_t end, int sz,
                            const char *want)
 {
     // inspecting in's lines from index first up to end, or to the text's end
@@ -2774,7 +2768,6 @@ static bool inspects_lines(const char *in, size_t first, size_t end,
     // there is one. Twice alike, the text unchanged, and shckit_inspect_all
     // agrees.
     struct shckit_text *text = read_text(in);
-    struct shckit_producer producer = {release, modes};
     struct shckit_function function = {first, end, sz};
     struct shckit_inspection result;
     struct shckit_inspection again;
@@ -2782,11 +2775,10 @@ static bool inspects_lines(const char *in, size_t first, size_t end,
     bool ok = text != NULL;
     if (ok) {
         function.end = end != 0 ? end : shckit_count(text);
-        ok = shckit_inspect(text, &producer, &function, &result) == SHCKIT_OK &&
-             shckit_inspect(text, &producer, &function, &again) == SHCKIT_OK &&
+        ok = shckit_inspect(text, &function, &result) == SHCKIT_OK &&
+             shckit_inspect(text, &function, &again) == SHCKIT_OK &&
              same_inspection(&result, &again) &&
-             all_agree(text, &producer, &function, &result) &&
-             same_bytes(text, in);
+             all_agree(text, &function, &result) && same_bytes(text, in);
     }
     if (ok) {
         describe(text, &result.witness, got, sizeof got);
@@ -2800,14 +2792,12 @@ static bool inspects_lines(const char *in, size_t first, size_t end,
     return ok;
 }
 
-static bool inspects_all(const char *in, const char *release, unsigned modes,
-                         int sz, const char *want)
+static bool inspects_all(const char *in, int sz, const char *want)
 {
     // inspecting the whole of in finds exactly want: every witness, each as
     // inspects_lines() gives one and after the first a comma, or none, then
     // the limit as inspects_lines() gives it
     struct shckit_text *text = read_text(in);
-    struct shckit_producer producer = {release, modes};
     struct shckit_function function = {0, 0, sz};
     struct shckit_inspection result;
     struct shckit_witness *found = NULL;
@@ -2816,8 +2806,8 @@ static bool inspects_all(const char *in, const char *release, unsigned modes,
     bool ok = text != NULL;
     if (ok) {
         function.end = shckit_count(text);
-        ok = shckit_inspect_all(text, &producer, &function, &result, &found,
-                                &count) == SHCKIT_OK;
+        ok = shckit_inspect_all(text, &function, &result, &found, &count) ==
+             SHCKIT_OK;
     }
     for (size_t i = 0; ok && i < count; i++) {
         if (i != 0) {
@@ -2840,85 +2830,38 @@ static bool inspects_all(const char *in, const char *release, unsigned modes,
     return ok;
 }
 
-static bool inspects(const char *in, const char *release, unsigned modes,
-                     int sz, const char *want)
+static bool inspects(const char *in, int sz, const char *want)
 {
-    return inspects_lines(in, 0, 0, release, modes, sz, want);
+    return inspects_lines(in, 0, 0, sz, want);
 }
 
 static void test_inspect_rules(void)
 {
-    // each instruction rule under the releases and modes it holds for, and
-    // a limit for an instruction it names under others
-    static const char *const fives[] = {
-        "5.0R10", "5.0R26", "5.0R27", "5.0R28", "5.0R31", "5.0R32",
-        "5.1R01", "5.1R03", "5.1R04", "5.1R08", "5.1R11", "5.1R13",
-    };
+    // each instruction rule, for an instruction no release is known to
+    // write
     static const struct {
         const char *body;
-        const char *rule;
         const char *want;
     } words[] = {
-        {S("ROTCL       R4"), "rotcl", "opcode rotcl 2"},
-        {S("ROTCR       R15"), "rotcr", "opcode rotcr 2; stack-unknown 2"},
-        {S("SWAP.B      R4,R5"), "swap", "opcode swap 2"},
-        {S("SWAP.W      R5,R6"), "swap", "opcode swap 2"},
+        {S("ROTCL       R4"), "opcode rotcl 2"},
+        {S("ROTCR       R15"), "opcode rotcr 2; stack-unknown 2"},
+        {S("SWAP.B      R4,R5"), "opcode swap 2"},
+        {S("SWAP.W      R5,R6"), "opcode swap 2"},
+        {S("DMULS.L     R4,R5"), "opcode dmuls 2"},
+        {S("DMULU       R4,R5"), "opcode dmulu 2"},
+        {S("OCBI        @R4"), "opcode cache-line 2"},
+        {S("OCBP        @R4"), "opcode cache-line 2"},
+        {S("OCBWB       @R4"), "opcode cache-line 2"},
+        {S("MOV         #0,R0") S("MOVCA.L     R0,@R4"), "opcode movca 3"},
     };
     char in[256];
-    for (size_t i = 0; i < sizeof fives / sizeof fives[0]; i++) {
-        bool stack = i == 0;
-        for (unsigned modes = OBJ; modes <= (OBJ | ASM); modes++) {
-            CHECK(inspects(F(S("DMULS.L     R4,R5") S("RTS") S("NOP")),
-                           fives[i], modes, UNKNOWN,
-                           stack ? "opcode dmuls 2"
-                                 : "opcode dmuls 2; abi-scope"));
-            CHECK(inspects(F(S("DMULU       R4,R5") S("RTS") S("NOP")),
-                           fives[i], modes, UNKNOWN,
-                           stack ? "opcode dmulu 2"
-                                 : "opcode dmulu 2; abi-scope"));
-        }
-    }
-    // ROTCL, ROTCR and SWAP: under machinecode in each 5.x release, and
-    // under asmcode in R10 and R32 alone
     for (size_t i = 0; i < sizeof words / sizeof words[0]; i++) {
-        char want[64];
         (void)snprintf(in, sizeof in, F("%s" S("RTS") S("NOP")), words[i].body);
-        (void)snprintf(want, sizeof want, "opcode %s 2; abi-scope",
-                       words[i].rule);
-        for (unsigned modes = OBJ; modes <= (OBJ | ASM); modes++) {
-            CHECK(inspects(in, R10, modes, UNKNOWN, words[i].want));
-            CHECK(inspects(in, R32, modes, UNKNOWN, want));
-        }
-        CHECK(inspects(in, "5.0R26", OBJ, UNKNOWN,
-                       i == 1 ? "opcode rotcr 2; rule-scope 2" : want));
-        CHECK(inspects(in, "5.0R26", ASM, UNKNOWN, "none; rule-scope 2"));
-        CHECK(inspects(in, "5.1R13", OBJ | ASM, UNKNOWN, "none; rule-scope 2"));
+        CHECK(inspects(in, UNKNOWN, words[i].want));
     }
 
-    // R10's and R32's cache-line opcodes and MOVCA.L, in both modes, where
-    // the stack rule holds for R10 alone
-    for (size_t i = 0; i < 2; i++) {
-        const char *release = i == 0 ? R10 : R32;
-        char want[64];
-        (void)snprintf(want, sizeof want, "opcode cache-line 2%s",
-                       i == 0 ? "" : "; abi-scope");
-        CHECK(inspects(F(S("OCBI        @R4") S("RTS") S("NOP")), release,
-                       OBJ | ASM, UNKNOWN, want));
-        CHECK(inspects(F(S("OCBP        @R4") S("RTS") S("NOP")), release, OBJ,
-                       UNKNOWN, want));
-        CHECK(inspects(F(S("OCBWB       @R4") S("RTS") S("NOP")), release, ASM,
-                       UNKNOWN, want));
-        (void)snprintf(want, sizeof want, "opcode movca 3%s",
-                       i == 0 ? "" : "; abi-scope");
-        CHECK(inspects(
-            F(S("MOV         #0,R0") S("MOVCA.L     R0,@R4") S("RTS") S("NOP")),
-            release, OBJ | ASM, UNKNOWN, want));
-    }
-
-    // SETT, which neither R10 nor R32 writes, in both modes and any case,
-    // before an ADDC, in a slot and where control never goes, but not as
-    // its word in data or in a comment, and rule-scope under a release the
-    // reading doesn't cover
+    // SETT, in any case, before an ADDC, in a slot and where control never
+    // goes, but not as its word in data or in a comment
     static const struct {
         const char *body;
         const char *want;
@@ -2933,66 +2876,35 @@ static void test_inspect_rules(void)
         {S("SETT") S("RTS") S("ADD         #8,R15"), "opcode sett 2"},
     };
     for (size_t i = 0; i < sizeof sets / sizeof sets[0]; i++) {
-        char want[64];
         (void)snprintf(in, sizeof in, F("%s"), sets[i].body);
-        (void)snprintf(want, sizeof want, "%s; abi-scope", sets[i].want);
-        CHECK(inspects(in, R10, OBJ, UNKNOWN, sets[i].want));
-        CHECK(inspects(in, R10, ASM, UNKNOWN, sets[i].want));
-        CHECK(inspects(in, R10, OBJ | ASM, UNKNOWN, sets[i].want));
-        CHECK(inspects(in, R32, OBJ | ASM, UNKNOWN, want));
+        CHECK(inspects(in, UNKNOWN, sets[i].want));
     }
     CHECK(INSPECTS(S("RTS") S("NOP") "L1:\n" S(".DATA.W     H'0018") "; SETT\n",
                    "none"));
-    CHECK(inspects(F(S("SETT") S("RTS") S("NOP")), "5.0R31", OBJ | ASM, UNKNOWN,
-                   "none; rule-scope 2"));
-    CHECK(inspects(F(S("SETT") S("RTS") S("NOP")), "6.0C.001", OBJ, UNKNOWN,
-                   "none; rule-scope 2"));
 
-    // FSCHG, which R32 has neither a builtin nor an encoder form for, and
-    // R10 writes for its builtins
-    CHECK(inspects(F(S("FSCHG") S("RTS") S("NOP")), R32, OBJ | ASM, UNKNOWN,
-                   "opcode fschg 2; abi-scope"));
-    CHECK(inspects(F(S("fschg") S("RTS") S("NOP")), R32, ASM, UNKNOWN,
-                   "opcode fschg 2; abi-scope"));
-    CHECK(inspects(F(S("FSCHG") S("RTS") S("NOP")), R10, OBJ | ASM, UNKNOWN,
-                   "none"));
-    CHECK(inspects(F(S("FSCHG") S("RTS") S("NOP")), "5.0R31", OBJ, UNKNOWN,
-                   "none; rule-scope 2"));
-    CHECK(inspects(F(S("FRCHG") S("RTS") S("NOP")), R32, OBJ | ASM, UNKNOWN,
-                   "none; abi-scope"));
-    CHECK(inspects(F(S("OCBI        @R4") S("RTS") S("NOP")), "5.0R31", OBJ,
-                   UNKNOWN, "none; rule-scope 2"));
-    CHECK(inspects(F(S("MOVCA.L     R0,@R4") S("RTS") S("NOP")), "5.1R13", OBJ,
-                   UNKNOWN, "none; rule-scope 2"));
-    CHECK(inspects(F(S("ROTCL       R4") S("RTS") S("NOP")), "6.0C.001", OBJ,
-                   UNKNOWN, "opcode rotcl 2; abi-scope"));
-    CHECK(inspects(F(S("DMULS.L     R4,R5") S("RTS") S("NOP")), "6.0C.001", OBJ,
-                   UNKNOWN, "none; rule-scope 2"));
-    CHECK(inspects(F(S("ROTCL       R4") S("RTS") S("NOP")), "6.0AD", OBJ,
-                   UNKNOWN, "none; producer-scope"));
-    CHECK(inspects(F(S("OCBI        @R4") S("RTS") S("NOP")), "gcc", OBJ,
-                   UNKNOWN, "none; producer-scope"));
+    // FSCHG and FRCHG, which R10 writes for its builtins, show nothing
+    CHECK(INSPECTS(S("FSCHG") S("RTS") S("NOP"), "none"));
+    CHECK(INSPECTS(S("fschg") S("RTS") S("NOP"), "none"));
+    CHECK(INSPECTS(S("FRCHG") S("RTS") S("NOP"), "none"));
 
-    // R10's fixed operands, and R32's FIPR's and FTRV's, in any case. The
-    // operands R32 writes itself are no witness.
+    // the fixed operands, in any case. The operands SHC writes itself are
+    // no witness.
     CHECK(INSPECTS(S("fipr.s      fv4,fv4") S("RTS") S("NOP"),
                    "operand fipr-registers 2"));
-    CHECK(inspects(F(S("FIPR        FV8,FV4") S("RTS") S("NOP")), R10, OBJ,
-                   UNKNOWN, "operand fipr-registers 2"));
+    CHECK(inspects(F(S("FIPR        FV8,FV4") S("RTS") S("NOP")), UNKNOWN,
+                   "operand fipr-registers 2"));
     CHECK(INSPECTS(S("FTRV        XMTRX,FV8") S("RTS") S("NOP"),
                    "operand ftrv-registers 2"));
-    CHECK(inspects(F(S("FSCA        FPUL,DR4") S("RTS") S("NOP")), R10,
-                   OBJ | ASM, UNKNOWN, "operand fsca-registers 2"));
-    CHECK(inspects(F(S("FIPR        FV4,FV4") S("RTS") S("NOP")), R32,
-                   OBJ | ASM, UNKNOWN, "operand fipr-registers 2; abi-scope"));
-    CHECK(inspects(F(S("FTRV        XMTRX,FV4") S("RTS") S("NOP")), R32,
-                   OBJ | ASM, UNKNOWN, "operand ftrv-registers 2; abi-scope"));
-    CHECK(inspects(F(S("FIPR        FV4,FV0") S("RTS") S("NOP")), R32,
-                   OBJ | ASM, UNKNOWN, "none; abi-scope"));
-    CHECK(inspects(F(S("FTRV        XMTRX,FV0") S("RTS") S("NOP")), R32,
-                   OBJ | ASM, UNKNOWN, "none; abi-scope"));
-    CHECK(inspects(F(S("FSCA        FPUL,DR4") S("RTS") S("NOP")), R32, ASM,
-                   UNKNOWN, "none; rule-scope 2"));
+    CHECK(inspects(F(S("FSCA        FPUL,DR4") S("RTS") S("NOP")), UNKNOWN,
+                   "operand fsca-registers 2"));
+    CHECK(inspects(F(S("FIPR        FV4,FV4") S("RTS") S("NOP")), UNKNOWN,
+                   "operand fipr-registers 2"));
+    CHECK(inspects(F(S("FTRV        XMTRX,FV4") S("RTS") S("NOP")), UNKNOWN,
+                   "operand ftrv-registers 2"));
+    CHECK(inspects(F(S("FIPR        FV4,FV0") S("RTS") S("NOP")), UNKNOWN,
+                   "none"));
+    CHECK(inspects(F(S("FTRV        XMTRX,FV0") S("RTS") S("NOP")), UNKNOWN,
+                   "none"));
 
     // what SHC writes, for a builtin or otherwise, and what no reading
     // excludes
@@ -3006,7 +2918,7 @@ static void test_inspect_rules(void)
         "none"));
     CHECK(inspects(F(S("CLRMAC") S("SUBC        R5,R4") S("DT          R6")
                          S("NEGC        R4,R0") S("CLRT") S("RTS") S("NOP")),
-                   R10, OBJ | ASM, UNKNOWN, "none"));
+                   UNKNOWN, "none"));
 
     // an opcode outranks operands and the ABI, whatever comes first, and a
     // limit on the stack leaves an instruction's witness standing
@@ -3027,30 +2939,35 @@ static void test_inspect_rules(void)
                    "none"));
     CHECK(INSPECTS(S("RTS") S("NOP") DATA S("OCBI        @R4"), "none"));
 
-    // of two limits at one line, continued before rule-scope
-    CHECK(inspects(F(S("SWAP.B      R4,") "+           R5\n" S("RTS") S("NOP")),
-                   "5.0R26", ASM, UNKNOWN, "none; continued 2"));
+    // an instruction with a continuation below it: a rule that reads the
+    // mnemonic alone finds its witness, and one that reads operands can't
+    CHECK(INSPECTS(S("SWAP.B      R4,") "+           R5\n" S("RTS") S("NOP"),
+                   "opcode swap 2; continued 2"));
+    CHECK(INSPECTS(S("FIPR        FV8,") "+           FV0\n" S("RTS") S("NOP"),
+                   "none; continued 2"));
 }
 
 static void test_inspect_operands(void)
 {
-    // a MOV.L of a constant from -128 to 127, under R10 in both modes: an
-    // expansion in any of asmsh's radixes, or a pool item through any label,
-    // plain or by .EQU, each word taken mod 2^32
+    // a MOV.L of a constant from -128 to -1: an expansion in any of asmsh's
+    // radixes, or a pool item through any label, plain or by .EQU, each word
+    // taken mod 2^32
     static const struct {
         const char *operand;
         long value;
     } small[] = {
-        {"#0", 0},           {"#-128", -128},       {"#127", 127},
-        {"#H'7F", 127},      {"#H'FFFFFF80", -128}, {"#-H'80", -128},
-        {"#-H'FFFFFFFF", 1}, {"#-H'FFFFFF81", 127}, {"#ZERO", 0},
-        {"L1", 0},           {"L1+4", -1},          {"L1+8", 0},
-        {"L1+20", -1},       {"L2", 127},           {"#b'1111111", 127},
-        {"#Q'177", 127},     {"#-D'128", -128},     {"#012", 12},
+        {"#-1", -1},         {"#-128", -128},   {"#H'FFFFFF80", -128},
+        {"#H'FFFFFFFF", -1}, {"#-H'80", -128},  {"#MINUS", -1},
+        {"L1+4", -1},        {"L1+20", -1},     {"#-b'1111111", -127},
+        {"#-Q'177", -127},   {"#-D'128", -128}, {"#-012", -12},
     };
+    // 0 and the words above it, which SHC writes for float constants, and
+    // the words past -128
     static const char *const large[] = {
-        "#128",    "#-129",   "#H'80", "#H'FFFFFF7F", "#-H'FFFFFF7F", "#BIG",
-        "#ZERO+0", "#_x",     "L1+12", "L3",          "#B'10000000",  "#Q'200",
+        "#0",      "#127",    "#H'7F", "#-H'FFFFFFFF", "#-H'FFFFFF81", "#ZERO",
+        "L1",      "L1+8",    "L2",    "#b'1111111",   "#Q'177",       "#012",
+        "#128",    "#-129",   "#H'80", "#H'FFFFFF7F",  "#-H'FFFFFF7F", "#BIG",
+        "#ZERO+0", "#_x",     "L1+12", "L3",           "#B'10000000",  "#Q'200",
         "#D'128",  "#-D'129", "#h'80", "#1+0",
     };
     static const char pools[] = S("RTS") S("NOP")
@@ -3064,6 +2981,7 @@ static void test_inspect_operands(void)
                                     "L7:       .SDATA      \"abcd\"\n"
                                     "L5:\n" S(
                                         "NOP") "ZERO:     .EQU        0\n"
+                                               "MINUS:    .EQU        -1\n"
                                                "BIG:      .EQU        H'100\n";
     char in[1024];
     for (size_t i = 0; i < sizeof small / sizeof small[0]; i++) {
@@ -3072,13 +2990,12 @@ static void test_inspect_operands(void)
                        small[i].operand, pools);
         (void)snprintf(want, sizeof want, "operand small-constant 2 #%ld",
                        small[i].value);
-        CHECK(inspects(in, R10, OBJ | ASM, UNKNOWN, want));
-        CHECK(inspects(in, R32, OBJ, UNKNOWN, "none; rule-scope 2"));
+        CHECK(inspects(in, UNKNOWN, want));
     }
     for (size_t i = 0; i < sizeof large / sizeof large[0]; i++) {
         (void)snprintf(in, sizeof in, F(S("MOV.L       %s,R4") "%s"), large[i],
                        pools);
-        CHECK(inspects(in, R10, OBJ, UNKNOWN, "none"));
+        CHECK(inspects(in, UNKNOWN, "none"));
     }
 
     // a word the walk can't read: inside a long, a word, a pad, a string or
@@ -3090,32 +3007,46 @@ static void test_inspect_operands(void)
     for (size_t i = 0; i < sizeof unread / sizeof unread[0]; i++) {
         (void)snprintf(in, sizeof in, F(S("MOV.L       %s,R4") "%s"), unread[i],
                        pools);
-        CHECK(inspects(in, R10, OBJ, UNKNOWN, "none; pool-word 2"));
-        CHECK(inspects(in, R32, OBJ, UNKNOWN, "none; rule-scope 2"));
+        CHECK(inspects(in, UNKNOWN, "none; pool-word 2"));
     }
 
     // a MOV with no size loads a pool's long, as MOV.L does, and #x as the
     // 8-bit immediate
-    (void)snprintf(in, sizeof in, F(S("MOV         L2,R4") "%s"), pools);
-    CHECK(inspects(in, R10, OBJ, UNKNOWN, "operand small-constant 2 #127"));
-    (void)snprintf(in, sizeof in, F(S("MOV         #0,R4") "%s"), pools);
-    CHECK(inspects(in, R10, OBJ, UNKNOWN, "none"));
+    (void)snprintf(in, sizeof in, F(S("MOV         L1+4,R4") "%s"), pools);
+    CHECK(inspects(in, UNKNOWN, "operand small-constant 2 #-1"));
+    (void)snprintf(in, sizeof in, F(S("MOV         #-1,R4") "%s"), pools);
+    CHECK(inspects(in, UNKNOWN, "none"));
 
-    // what SHC writes for a small constant, and an .EQU defined twice, which
-    // asmsh reads as its first
+    // what SHC writes for a small constant: R32's float 0.0 and a denormal
+    // word from -denormalize=on, each by MOV.L, LDS and FSTS; and an .EQU
+    // defined twice, which asmsh reads as its first
+    static const char *const floats[] = {
+        S("MOV.L       L1+4,R1") S("LDS         R1,FPUL")
+            S("FSTS        FPUL,FR3") S("RTS")
+                S("FMOV.S      FR3,@R4") "L1:\n" S(".RES.W      1")
+                    S(".DATA.W     1") S(".DATA.L     H'00000000"),
+        S("MOV.L       L1+4,R1") S("LDS         R1,FPUL")
+            S("FSTS        FPUL,FR3") S("RTS")
+                S("FMOV.S      FR3,@R4") "L1:\n" S(".DATA.L     H'3F800007")
+                    S(".DATA.L     H'0000007F"),
+    };
+    for (size_t i = 0; i < sizeof floats / sizeof floats[0]; i++) {
+        (void)snprintf(in, sizeof in, F("%s"), floats[i]);
+        CHECK(inspects(in, UNKNOWN, "none"));
+    }
     CHECK(inspects(F(S("MOV         #0,R4") S("MOV.W       L1,R5") S("RTS")
                          S("NOP") "L1:       .DATA.W     0\n"),
-                   R10, OBJ, UNKNOWN, "none"));
+                   UNKNOWN, "none"));
     CHECK(inspects(
-        F(S("MOV.L       #ZERO,R4") S("RTS") S("NOP")) "ZERO: .EQU 0\n"
+        F(S("MOV.L       #ZERO,R4") S("RTS") S("NOP")) "ZERO: .EQU -1\n"
                                                        "ZERO: .EQU 200\n",
-        R10, OBJ, UNKNOWN, "operand small-constant 2 #0"));
+        UNKNOWN, "operand small-constant 2 #-1"));
     CHECK(inspects(
         F(S("MOV.L       #ZERO,R4") S("RTS") S("NOP")) "ZERO: .EQU 200\n"
-                                                       "ZERO: .EQU 0\n",
-        R10, OBJ, UNKNOWN, "none"));
+                                                       "ZERO: .EQU -1\n",
+        UNKNOWN, "none"));
 
-    // a MOV through @(0,Rn), under R10 and R32 in both modes
+    // a MOV through @(0,Rn)
     static const char *const zero[] = {
         "R1,@(0,R4)",   "@(0,R4),R1",      "R1,@(ZERO,R4)",
         "@(H'0,SP),R1", "@( -0 , R4 ),R1", "@(-H'0,R4),R1",
@@ -3131,11 +3062,7 @@ static void test_inspect_operands(void)
         (void)snprintf(
             in, sizeof in,
             F(S("MOV.L       %s") S("RTS") S("NOP")) "ZERO: .EQU 0\n", zero[i]);
-        CHECK(inspects(in, R10, OBJ | ASM, UNKNOWN,
-                       "operand zero-displacement 2"));
-        CHECK(inspects(in, R32, OBJ | ASM, UNKNOWN,
-                       "operand zero-displacement 2; abi-scope"));
-        CHECK(inspects(in, "5.1R13", OBJ, UNKNOWN, "none; rule-scope 2"));
+        CHECK(inspects(in, UNKNOWN, "operand zero-displacement 2"));
     }
     for (size_t i = 0; i < sizeof other / sizeof other[0]; i++) {
         (void)snprintf(
@@ -3143,7 +3070,7 @@ static void test_inspect_operands(void)
             F(S("MOV.L       %s") S("RTS") S("NOP")) "BIG: .EQU 4\n"
                                                      "ZERO: .EQU 0\n",
             other[i]);
-        CHECK(inspects(in, R10, OBJ | ASM, UNKNOWN, "none"));
+        CHECK(inspects(in, UNKNOWN, "none"));
     }
     CHECK(INSPECTS(S("MOV.W       @(0,R4),R0") S("MOV.B       R0,@(0,R5)")
                        S("RTS") S("NOP"),
@@ -3189,14 +3116,14 @@ static void test_inspect_operands(void)
          "Z:        .ASSIGN     0\n" S("MOV.L       @(Z,R4),R1"),
          "none"},
         {"Z:        .ASSIGN     1-1\n" S("MOV.L       @(Z,R4),R1"), "none"},
-        {"Z:        .ASSIGN     0\n" S("MOV.L       L1,R4") S("RTS")
+        {"Z:        .ASSIGN     -1\n" S("MOV.L       L1,R4") S("RTS")
              S("NOP") "L1:       .DATA.L     Z\n" S(
                  "NOP") "Z:        .ASSIGN     200\n",
-         "operand small-constant 3 #0"},
+         "operand small-constant 3 #-1"},
         {S("MOV.L       L1,R4") S("RTS") S("NOP") "L1:       .DATA.L     Z\n" S(
-             "NOP") "Z:        .ASSIGN     200\n",
-         "operand small-constant 2 #0"},
-        {"Z:        .ASSIGN     0\n"
+             "NOP") "Z:        .ASSIGN     -1\n",
+         "none"},
+        {"Z:        .ASSIGN     -1\n"
          "Z:        .ASSIGN     200\n" S("MOV.L       L1,R4") S("RTS")
              S("NOP") "L1:       .DATA.L     Z\n",
          "none"},
@@ -3205,22 +3132,503 @@ static void test_inspect_operands(void)
         // defines x, whatever an .ASSIGN below gives it before the pool.
         // Above the first, it takes the value x has where it writes the
         // pool, which inspect doesn't place, so x is no constant there:
-        // asmsh writes 7 here.
-        {"Z:        .ASSIGN     0\n" S("MOV.L       #Z,R4"),
-         "operand small-constant 3 #0"},
-        {"Z:        .ASSIGN     0\n" S(
+        // asmsh writes -7 here.
+        {"Z:        .ASSIGN     -1\n" S("MOV.L       #Z,R4"),
+         "operand small-constant 3 #-1"},
+        {"Z:        .ASSIGN     -1\n" S(
              "MOV.L       #Z,R4") "Z:        .ASSIGN     200\n",
-         "operand small-constant 3 #0"},
-        {"Z: .ASSIGN 200\n" S("MOV.L       #Z,R4") "Z: .ASSIGN 5\n" S(
+         "operand small-constant 3 #-1"},
+        {"Z: .ASSIGN 200\n" S("MOV.L       #Z,R4") "Z: .ASSIGN -5\n" S(
              "MOV.L       #Z,R5"),
-         "operand small-constant 5 #5"},
-        {S("MOV.L       #Z,R4") "Z:        .ASSIGN     7\n", "none"},
+         "operand small-constant 5 #-5"},
+        {S("MOV.L       #Z,R4") "Z:        .ASSIGN     -7\n", "none"},
     };
     for (size_t i = 0; i < sizeof assigned / sizeof assigned[0]; i++) {
         (void)snprintf(in, sizeof in, F("%s" S("RTS") S("NOP")),
                        assigned[i].body);
-        CHECK(inspects(in, R10, OBJ | ASM, UNKNOWN, assigned[i].want));
+        CHECK(inspects(in, UNKNOWN, assigned[i].want));
     }
+}
+
+static void test_inspect_integers(void)
+{
+    // a MOV.L of a word from 0 to 32767 or from -32768 to -129, first read
+    // on every path as an integer: by an integer instruction, or as an
+    // address or an index
+    static const char *const integers[] = {
+        "ADD         R1,R2",       "ADD         #-1,R1",
+        "SUB         R2,R1",       "AND         R1,R2",
+        "OR          R1,R2",       "XOR         R1,R2",
+        "NOT         R1,R2",       "NEG         R1,R2",
+        "SHLL2       R1",          "SHAD        R1,R2",
+        "ROTL        R1",          "CMP/HI      R1,R2",
+        "CMP/PZ      R1",          "TST         R1,R1",
+        "DT          R1",          "EXTU.B      R1,R2",
+        "EXTS.W      R1,R2",       "MUL.L       R1,R2",
+        "MULS.W      R2,R1",       "DIV0S       R1,R2",
+        "DIV1        R1,R2",       "MOV.L       @R1,R2",
+        "MOV.L       R2,@R1",      "MOV.L       @(4,R1),R2",
+        "MOV.W       @(R0,R1),R2", "MOV.L       R2,@-R1",
+        "FMOV.S      @R1,FR0",     "FMOV.S      FR0,@(R0,R1)",
+        "PREF        @R1",         "TAS.B       @R1",
+        "LDS.L       @R1+,MACL",   "MAC.W       @R1+,@R2+",
+        "LDC.L       @R1+,SR",
+    };
+    // and R0 as an index, or an integer instruction's
+    static const char *const indexes[] = {
+        "MOV.L       @(R0,R4),R2",
+        "AND.B       #1,@(R0,GBR)",
+        "CMP/EQ      #8,R0",
+        "TST         #1,R0",
+    };
+    char in[1024];
+    for (size_t i = 0; i < sizeof integers / sizeof integers[0]; i++) {
+        (void)snprintf(in, sizeof in,
+                       F(S("MOV.L       L1,R1") S("%s") S("RTS")
+                             S("NOP") "L1:       .DATA.L     128\n"),
+                       integers[i]);
+        CHECK(inspects(in, UNKNOWN, "operand integer-constant 2 #128"));
+    }
+    for (size_t i = 0; i < sizeof indexes / sizeof indexes[0]; i++) {
+        (void)snprintf(in, sizeof in,
+                       F(S("MOV.L       L1,R0") S("%s") S("RTS")
+                             S("NOP") "L1:       .DATA.L     128\n"),
+                       indexes[i]);
+        CHECK(inspects(in, UNKNOWN, "operand integer-constant 2 #128"));
+    }
+
+    // the constants it reads, through #x or a pool and in any radix, and
+    // those it leaves: small-constant's, and the words past 16 bits
+    static const struct {
+        const char *operand;
+        const char *want;
+    } words[] = {
+        {"#0", "operand integer-constant 2 #0"},
+        {"#32767", "operand integer-constant 2 #32767"},
+        {"#H'7FFF", "operand integer-constant 2 #32767"},
+        {"#-32768", "operand integer-constant 2 #-32768"},
+        {"#H'FFFF8000", "operand integer-constant 2 #-32768"},
+        {"#-129", "operand integer-constant 2 #-129"},
+        {"#B'10000000", "operand integer-constant 2 #128"},
+        {"#WORD", "operand integer-constant 2 #300"},
+        {"L1+4", "operand integer-constant 2 #300"},
+        {"#-128", "operand small-constant 2 #-128"},
+        {"#-1", "operand small-constant 2 #-1"},
+        {"#32768", "none"},
+        {"#-32769", "none"},
+        {"#H'00010000", "none"},
+        {"L1", "none"},
+        {"#_x", "none"},
+    };
+    for (size_t i = 0; i < sizeof words / sizeof words[0]; i++) {
+        (void)snprintf(in, sizeof in,
+                       F(S("MOV.L       %s,R1") S("ADD         R1,R2") S("RTS")
+                             S("NOP") "L1:       .DATA.L     _x,300\n"
+                                      "WORD:     .EQU        300\n"),
+                       words[i].operand);
+        CHECK(inspects(in, UNKNOWN, words[i].want));
+    }
+    // a MOV with no size loads a pool's long as MOV.L does, and #x as the
+    // 8-bit immediate. MOV.W loads a word.
+    CHECK(INSPECTS(S("MOV         L1,R1") S("ADD         R1,R2") S("RTS")
+                       S("NOP") "L1:       .DATA.L     128\n",
+                   "operand integer-constant 2 #128"));
+    CHECK(INSPECTS(S("MOV         #5,R1") S("ADD         R1,R2") S("RTS")
+                       S("NOP"),
+                   "none"));
+    CHECK(INSPECTS(S("MOV.W       L1,R1") S("ADD         R1,R2") S("RTS")
+                       S("NOP") "L1:       .DATA.W     128\n",
+                   "none"));
+
+    // a word unread in R4 to R7 at a JSR, a BSR or a JMP, copied there or
+    // not; one kept in R8 to R15 past a call; one a call's slot reads; and a
+    // JSR's address
+    static const struct {
+        const char *body;
+        const char *want;
+    } calls[] = {
+        {S("MOV.L       L1,R4") S("MOV.L       L1+4,R2") S("JSR         @R2")
+             S("NOP"),
+         "operand integer-constant 2 #128; call 4"},
+        {S("MOV.L       L1,R7") S("BSR         _g") S("NOP"),
+         "operand integer-constant 2 #128; call 3"},
+        {S("MOV.L       L1,R5") S("MOV.L       L1+4,R2") S("JMP         @R2")
+             S("NOP"),
+         "operand integer-constant 2 #128; opaque-transfer 4"},
+        {S("MOV.L       L1,R1") S("MOV         R1,R6") S("BSR         _g")
+             S("NOP"),
+         "operand integer-constant 2 #128; call 4"},
+        {S("MOV.L       L1,R1") S("MOV         R1,R8") S("BSR         _g")
+             S("NOP") S("RTS") S("ADD         R8,R0"),
+         "operand integer-constant 2 #128; call 4"},
+        {S("MOV.L       L1,R1") S("BSR         _g") S("ADD         R1,R4"),
+         "operand integer-constant 2 #128; call 3"},
+        {S("MOV.L       L1,R1") S("JSR         @R1") S("NOP"),
+         "operand integer-constant 2 #128; call 3"},
+        {S("MOV.L       L1+4,R4") S("JSR         @R4") S("NOP"),
+         "none; call 3"},
+    };
+    for (size_t i = 0; i < sizeof calls / sizeof calls[0]; i++) {
+        (void)snprintf(
+            in, sizeof in,
+            F("%s" S("RTS") S("NOP") "L1:       .DATA.L     128,_g\n"),
+            calls[i].body);
+        CHECK(inspects(in, UNKNOWN, calls[i].want));
+    }
+
+    // any other first read shows nothing: an LDS or LDC of any system
+    // register, a store or a push, an integer instruction the rule doesn't
+    // name, and a store through the word's own register
+    static const char *const others[] = {
+        "LDS         R1,FPUL", "LDS         R1,PR",
+        "LDS         R1,MACL", "LDC         R1,GBR",
+        "LDC         R1,SR",   "LDC         R1,R2_BANK",
+        "MOV.L       R1,@R4",  "MOV.L       R1,@(4,R4)",
+        "MOV.W       R1,@R4",  "MOV.B       R1,@R4",
+        "MOV.L       R1,@R1",  "ADDC        R1,R2",
+        "ADDV        R1,R2",   "SUBC        R1,R2",
+        "SUBV        R1,R2",   "NEGC        R1,R2",
+        "XTRCT       R1,R2",
+    };
+    for (size_t i = 0; i < sizeof others / sizeof others[0]; i++) {
+        (void)snprintf(in, sizeof in,
+                       F(S("MOV.L       L1,R1") S("%s") S("RTS")
+                             S("NOP") "L1:       .DATA.L     128\n"),
+                       others[i]);
+        CHECK(inspects(in, UNKNOWN, "none"));
+    }
+    // SWAP reads it so too, and is a witness of its own
+    CHECK(inspects_all(F(S("MOV.L       L1,R1") S("SWAP.W      R1,R2") S("RTS")
+                             S("NOP") "L1:       .DATA.L     128\n"),
+                       UNKNOWN, "opcode swap 3"));
+    static const struct {
+        const char *body;
+        const char *want;
+    } leaves[] = {
+        // a push, popped, a copy LDS reads first, and a word overwritten
+        // before any read
+        {S("MOV.L       L1,R1") S("MOV.L       R1,@-R15")
+             S("ADD         #4,R15") S("RTS") S("NOP"),
+         "none"},
+        {S("MOV.L       L1,R1") S("MOV         R1,R2") S("LDS         R2,FPUL")
+             S("RTS") S("ADD         R1,R0"),
+         "none"},
+        {S("MOV.L       L1,R1") S("MOV         #0,R1") S("ADD         R1,R2")
+             S("RTS") S("NOP"),
+         "none"},
+        // the word unread at a return, a TRAPA, a JMP other than in R4 to R7,
+        // BRAF and a call, which takes R0 to R7, a BSRF's R4 and one a slot
+        // writes among them; and BRAF reading it
+        {S("MOV.L       L1,R0") S("RTS") S("NOP"), "none"},
+        {S("MOV.L       L1,R0") S("RTE") S("NOP"), "none"},
+        {S("MOV.L       L1,R4") S("TRAPA       #5") S("RTS") S("NOP"),
+         "none; opaque-transfer 3"},
+        {S("MOV.L       L1,R1") S("MOV.L       L1+4,R2") S("JMP         @R2")
+             S("NOP"),
+         "none; opaque-transfer 4"},
+        {S("MOV.L       L1,R4") S("BRAF        R2") S("NOP"),
+         "none; opaque-transfer 3"},
+        {S("MOV.L       L1,R1") S("BRAF        R1") S("NOP"),
+         "none; opaque-transfer 3"},
+        {S("MOV.L       L1,R1") S("MOV.L       L1+4,R2") S("JSR         @R2")
+             S("NOP") S("RTS") S("ADD         R1,R0"),
+         "none; call 4"},
+        {S("MOV.L       L1,R4") S("BSRF        R2") S("NOP") S("RTS") S("NOP"),
+         "none; call 3"},
+        {S("MOV.L       L1,R4") S("JSR         @R2") S("MOV         #0,R4")
+             S("RTS") S("NOP"),
+         "none; call 3"},
+        // R3 at a call, which is no argument, R7 past a BSRF, and a read
+        // past a TRAPA
+        {S("MOV.L       L1,R3") S("JSR         @R2") S("NOP") S("RTS") S("NOP"),
+         "none; call 3"},
+        {S("MOV.L       L1,R7") S("BSRF        R2") S("NOP") S("RTS")
+             S("ADD         R7,R0"),
+         "none; call 3"},
+        {S("MOV.L       L1,R1") S("TRAPA       #5") S("RTS")
+             S("ADD         R1,R0"),
+         "none; opaque-transfer 3"},
+        // paths that join holding it in different registers, or in one on
+        // some paths alone, a path that reads it otherwise beside one that
+        // reads it as an integer, and a loop that never reads it
+        {S("MOV.L       L1,R1") S("BT          ?a") S("MOV         R1,R2")
+             S("MOV         #0,R1") "?a:\n" S("ADD         R2,R3") S("RTS")
+                 S("NOP"),
+         "none"},
+        {S("MOV.L       L1,R1") S("BT          ?a")
+             S("MOV         R1,R2") "?a:\n" S("ADD         R2,R3") S("RTS")
+                 S("NOP"),
+         "none"},
+        {S("MOV.L       L1,R1") S("BT          ?a")
+             S("MOV         R1,R2") "?a:\n" S("LDS         R2,FPUL")
+                 S("ADD         R1,R3") S("RTS") S("NOP"),
+         "none"},
+        {S("MOV.L       L1,R1") S("BT          ?a")
+             S("LDS         R1,FPUL") "?a:\n" S("RTS") S("ADD         R1,R0"),
+         "none"},
+        // a copy of a register that holds it on some paths alone, read
+        {S("MOV.L       L1,R1") S("MOV         R1,R2")
+             S("BT          ?c") "?j:\n" S("MOV         R2,R3")
+                 S("ADD         R3,R4") S("RTS")
+                     S("ADD         R1,R0") "?c:\n" S("MOV         #0,R2")
+                         S("BRA         ?j") S("NOP"),
+         "none"},
+        // a switch of bank with the word in R0 to R7, on every path or on
+        // some, or with a copy of it there: an LDC to SR, and an RTE, whose
+        // slot runs in the bank it restores. In R8 alone the word stays, as it
+        // does in R1 past an LDC to another register.
+        {S("MOV.L       L1,R1") S("LDC         R2,SR") S("ADD         R1,R3")
+             S("RTS") S("NOP"),
+         "none"},
+        {S("MOV.L       L1,R1") S("LDC.L       @R2+,SR") S("ADD         R1,R3")
+             S("RTS") S("NOP"),
+         "none"},
+        {S("MOV.L       L1,R1") S("MOV         R1,R8") S("LDC         R2,SR")
+             S("ADD         R8,R3") S("RTS") S("NOP"),
+         "none"},
+        {S("MOV.L       L1,R8") S("BT          ?a")
+             S("MOV         R8,R1") "?a:\n" S("LDC         R2,SR")
+                 S("ADD         R8,R3") S("RTS") S("NOP"),
+         "none"},
+        {S("MOV.L       L1,R1") S("RTE") S("ADD         R1,R0"), "none"},
+        {S("MOV.L       L1,R8") S("LDC         R2,SR") S("ADD         R8,R3")
+             S("RTS") S("NOP"),
+         "operand integer-constant 2 #128"},
+        {S("MOV.L       L1,R8") S("RTE") S("ADD         R8,R0"),
+         "operand integer-constant 2 #128"},
+        {S("MOV.L       L1,R1") S("LDC         R2,GBR") S("ADD         R1,R3")
+             S("RTS") S("NOP"),
+         "operand integer-constant 2 #128"},
+        // a call that finds it in R4 on some paths alone, whichever of them
+        // the walk follows first
+        {S("MOV.L       L1,R8") S("MOV         R8,R4") S("BT          ?c")
+             S("MOV         #0,R4") "?c:\n" S("JSR         @R1")
+                 S("NOP") "?s:\n" S("BRA         ?s") S("NOP"),
+         "none; call 7"},
+        {S("MOV.L       L1,R8") S("MOV         R8,R4")
+             S("BF          ?z") "?c:\n" S("JSR         @R1")
+                 S("NOP") "?s:\n" S("BRA         ?s") S("NOP") "?z:\n" S(
+                     "BRA         ?c") S("MOV         #0,R4"),
+         "none; call 6"},
+        {S("MOV.L       L1,R0") S("BT          ?a") S("RTS")
+             S("NOP") "?a:\n" S("ADD         R0,R1") S("RTS") S("NOP"),
+         "none"},
+        {S("MOV.L       L1,R1") S("BT          ?a") S("JMP         @R2")
+             S("NOP") "?a:\n" S("RTS") S("ADD         R1,R0"),
+         "none; opaque-transfer 4"},
+        {S("MOV.L       L1,R8") "?a:\n" S("BRA         ?a") S("NOP"), "none"},
+        // a loop that reaches the load again, which overwrites the word, a
+        // loop that doesn't, and the word read in a back branch's slot
+        {"?a:\n" S("MOV.L       L1,R1") S("BF          ?a") S("RTS")
+             S("ADD         R1,R0"),
+         "none"},
+        {S("MOV.L       L1,R1") "?a:\n" S("DT          R2") S("BF          ?a")
+             S("RTS") S("ADD         R1,R0"),
+         "operand integer-constant 2 #128"},
+        {S("MOV.L       L1,R1") "?a:\n" S("BF/S        ?a")
+             S("ADD         R1,R2") S("RTS") S("NOP"),
+         "operand integer-constant 2 #128"},
+    };
+    for (size_t i = 0; i < sizeof leaves / sizeof leaves[0]; i++) {
+        (void)snprintf(in, sizeof in, F("%s") "L1:       .DATA.L     128,_g\n",
+                       leaves[i].body);
+        CHECK(inspects(in, UNKNOWN, leaves[i].want));
+    }
+    // a branch out with the word unread, past the function's lines
+    CHECK(inspects_lines(
+        F(S("MOV.L       L1,R1") S("BRA         _g") S("NOP")) "_g:\n" S("RTS")
+            S("ADD         R1,R0") "L1:       .DATA.L     128\n",
+        0, 4, UNKNOWN, "none"));
+    // and beside a path that reads it as an integer
+    CHECK(inspects_lines(F(S("MOV.L       L1,R1") S("BT          ?a")
+                               S("BRA         _g") S("NOP") "?a:\n" S("RTS")
+                                   S("ADD         R1,R0")) "_g:\n" S("RTS")
+                             S("NOP") "L1:       .DATA.L     128\n",
+                         0, 8, UNKNOWN, "none"));
+
+    // a path that meets a limit leaves the load no witness, and the limit is
+    // the inspection's unless another path shows none. These lie past the
+    // stack rule's lines, but the call's, which it reaches too, and a limit
+    // of the rule's comes before the stack rule's at one line.
+    static const struct {
+        const char *body;
+        const char *want;
+    } limits[] = {
+        {S("RTS") S("NOP") S("MOV.L       #128,R8") S("NOP"),
+         "none; fallthrough 5"},
+        {S("RTS") S("NOP") S("MOV.L       #128,R8"), "none; fallthrough 4"},
+        {S("RTS") S("NOP") S("MOV.L       #128,R8") S("BT          ?a") S("RTS")
+             S("ADD         R8,R0") "?a:\n" S("NOP"),
+         "none; fallthrough 9"},
+        {S("RTS") S("NOP") S("MOV.L       #128,R8") S("BT          ?a")
+             S("LDS         R8,FPUL") "?a:\n" S("NOP"),
+         "none"},
+        {S("RTS") S("NOP") S("MOV.L       #128,R1") S("BT          ?s")
+             S("RTS") "?s:\n" S("ADD         R1,R0"),
+         "none; entered-delay-slot 8"},
+        {S("RTS") S("NOP") S("MOV.L       #128,R1") S("BRA         _a") S("NOP")
+             CODE "_a:\n" S("ADD         R1,R0"),
+         "none; section-change 5"},
+        {S("MOV.L       #128,R8") S("JSR         @R2") S("NOP"),
+         "none; fallthrough 3"},
+        // a limit a path reaches with the word, and one a join of paths that
+        // hold it in different registers reaches, which shows none first
+        {S("RTS") S("NOP") S("MOV.L       #128,R1") S("BRA         _none")
+             S("ADD         R1,R0"),
+         "none; branch-target 5"},
+        {S("RTS") S("NOP") S("MOV.L       #128,R1") S("BT          ?a")
+             S("MOV         R1,R2") S("MOV         #0,R1") "?a:\n" S(
+                 "BRA         _none") S("ADD         R2,R0"),
+         "none"},
+        // of two limits, the first by line: one load's, on two paths, and
+        // two loads'
+        {S("RTS") S("NOP") S("MOV.L       #128,R1") S("BT          ?a")
+             S("BRA         _none") S("NOP") "?a:\n" S("NOP"),
+         "none; branch-target 6"},
+        {S("RTS") S("NOP") S("MOV.L       #128,R1") S("BRA         _none")
+             S("NOP") S("MOV.L       #128,R2") S("NOP"),
+         "none; branch-target 5"},
+    };
+    for (size_t i = 0; i < sizeof limits / sizeof limits[0]; i++) {
+        (void)snprintf(in, sizeof in, F("%s"), limits[i].body);
+        CHECK(inspects(in, UNKNOWN, limits[i].want));
+    }
+
+    // a word whose run of data the text names may be a variable: pool-word
+    // where it would be a witness, and nothing where its use shows none
+    static const char named[] = F(S("MOV.L       ?k,R1") S("%s") S("RTS") S(
+        "NOP") ALIGN "?k:       .DATA.L     128\n" S(".EXPORT     ?k"));
+    (void)snprintf(in, sizeof in, named, "ADD         R1,R2");
+    CHECK(inspects(in, UNKNOWN, "none; pool-word 2"));
+    (void)snprintf(in, sizeof in, named, "LDS         R1,FPUL");
+    CHECK(inspects(in, UNKNOWN, "none"));
+
+    // with --all, at one line in the rules table's order
+    CHECK(inspects_all(F(S("MOV.L       #100,R15") S("MOV.L       R1,@-R15")
+                             S("RTS") S("NOP")),
+                       UNKNOWN,
+                       "operand integer-constant 2 #100, abi stack-written 2; "
+                       "stack-unknown 2"));
+
+    // what hand-written assembly holds, cut down: a service call's command
+    // in R7 at its JMP, a count DT reads, on two paths DT and ADD, a mask AND
+    // reads, and the types CMP/EQ compares
+    static const struct {
+        const char *in;
+        const char *want;
+    } written[] = {
+        {F(S("MOV         #0,R6") S("MOV.L       #0,R7")
+               S("MOV.L       #ENTRY,R0") S("MOV.L       @R0,R0")
+                   S("JMP         @R0") S("NOP")) "ENTRY:    .EQU        "
+                                                  "H'8C010000\n",
+         "operand integer-constant 3 #0; opaque-transfer 6"},
+        {F(S("MOV         #0,R0") S("MOV.L       #_buckets,R1")
+               S("MOV.L       #H'00000080,R7") "?L1:\n" S("MOV.L       R0,@R1")
+                   S("MOV.L       R0,@(4,R1)") S("DT          R7")
+                       S("BF/S        ?L1") S("ADD         #8,R1") S("RTS")
+                           S("NOP")),
+         "operand integer-constant 4 #128"},
+        {F(S("MOV.L       #_buckets,R1") S("MOV.L       #H'00000080,R7") S(
+             "MOV         #0,R5") "?L1:\n" S("MOV.L       @R1,R0")
+               S("TST         R0,R0") S("BF          ?L2") S(
+                   "ADD         #8,R1") S("DT          R7") S("BF          ?L1")
+                   S("BRA         ?L3") S("NOP") "?L2:\n" S(
+                       "MOV.L       R0,@(16,R4)") S("MOV.L       @(4,R1),R5")
+                       S("ADD         #8,R1") S("ADD         #-1,R7")
+                           S("CMP/PL      R7") "?L3:\n" S("RTS") S("NOP")),
+         "operand integer-constant 3 #128"},
+        {F(S("MOV.L       ?MASK,R0") S("MOV         R4,R2") S(
+             "ADD         #6,R2") S("PREF        @R2") S("MOV         R6,R1")
+               S("AND         R0,R1") S("RTS") S("MOV         R1,R0") ALIGN
+           "?MASK:\n" S(".DATA.L     H'00003FFF") S(".DATA.L     H'E0000000")),
+         "operand integer-constant 2 #16383"},
+    };
+    for (size_t i = 0; i < sizeof written / sizeof written[0]; i++) {
+        CHECK(inspects(written[i].in, UNKNOWN, written[i].want));
+    }
+    CHECK(inspects_all(
+        F(S("MOV.L       #H'00000020,R2") S("CMP/EQ      R1,R2")
+              S("BF          ?L1") S("BRA         ?L3") S(
+                  "MOV.L       R3,@R7") "?L1:\n" S("MOV.L       #H'00000008,R2")
+                  S("CMP/EQ      R1,R2") S("BF          ?L3")
+                      S("MOV.L       R3,@R7") "?L3:\n" S("RTS") S("NOP")),
+        UNKNOWN,
+        "operand integer-constant 2 #32, operand integer-constant 8 #8"));
+
+    // what SHC writes for C, cut down, which no rule may witness: float
+    // words SHC loads by MOV.L for LDS and FSTS, the integers beside them
+    // by MOV.W, and under -pic=1 a distance it writes as symbols
+    static const char *const compiled[] = {
+        // 5.0 R32 -cpu=sh4 -optimize=1 -speed, no -fpu: void s_idx0(float *p,
+        // int i) { p[i] = 0.0f; }, and a MOVA of its word beside it
+        S("MOV.L       L1,R1") S("MOV         R5,R0") S("SHLL2       R0")
+            S("LDS         R1,FPUL") S("FSTS        FPUL,FR3") S("RTS") S(
+                "FMOV.S      FR3,@(R0,R4)") "_r_zero:\n" S("MOVA        L1,R0")
+                S("RTS") S("FMOV.S      @R0,FR0") "L1:\n" S(
+                    ".DATA.L     H'00000000"),
+        // 5.0 R26 -fpu=single -denormalize=on: void s_idx(float *p, int i)
+        // { p[i] = 1.78e-43f; }
+        S("MOV.L       L1+4,R1") S("MOV         R5,R0") S("SHLL2       R0")
+            S("LDS         R1,FPUL") S("FSTS        FPUL,FR3") S("RTS") S(
+                "FMOV.S      FR3,@(R0,R4)") "L1:\n" S(".DATA.L     H'80000000")
+                S(".DATA.L     H'0000007F"),
+        // 5.1 R13 the same: void w_128i(float *p, int *q, int i)
+        // { p[i] = 1.794e-43f; q[i] = 128; }
+        S("MOV.L       L1+8,R3") S("SHLL2       R6") S("MOV         R6,R0")
+            S("LDS         R3,FPUL") S("MOV.W       L1,R3")
+                S("FSTS        FPUL,FR3") S("FMOV.S      FR3,@(R0,R4)") S("RTS")
+                    S("MOV.L       R3,@(R0,R5)") "L1:\n" S(".DATA.W     H'0080")
+                        S(".DATA.W     H'7FFF") S(".DATA.W     H'0200")
+                            S(".RES.W      1") S(".DATA.L     H'00000080")
+                                S(".DATA.L     H'00007FFE"),
+        // 5.0 R26 the same: int w_7fff(float *p, int i, int j)
+        // { p[i] = 4.5916e-41f; return j + 32767; }
+        S("MOV.L       L1+12,R1") S("MOV         R5,R0") S("SHLL2       R0")
+            S("LDS         R1,FPUL") S("FSTS        FPUL,FR3")
+                S("FMOV.S      FR3,@(R0,R4)") S("MOV.W       L1+2,R0") S("RTS")
+                    S("ADD         R6,R0") "L1:\n" S(".DATA.W     H'0080")
+                        S(".DATA.W     H'7FFF") S(".DATA.W     H'0200")
+                            S(".RES.W      1") S(".DATA.L     H'00000080")
+                                S(".DATA.L     H'00007FFE"),
+        // 5.1 R03 the same: void z_fden(float *p, int i) { ... p[i + 1] =
+        // 4.5e-44f; p[i + 2] = 4.59e-41f; ... }
+        S("MOV.L       L1+4,R1") S("MOV         R5,R0") S("FLDI0       FR3")
+            S("SHLL2       R0") S("LDS         R1,FPUL")
+                S("FMOV.S      FR3,@(R0,R4)") S("MOV         R5,R0")
+                    S("ADD         #1,R0") S("MOV.L       L1+8,R1")
+                        S("FSTS        FPUL,FR3") S("SHLL2       R0") S(
+                            "LDS         R1,FPUL") S("FMOV.S      FR3,@(R0,R4)")
+                            S("MOV         R5,R0") S("ADD         #2,R0")
+                                S("FSTS        FPUL,FR3") S("SHLL2       R0")
+                                    S("RTS")
+                                        S("FMOV.S      FR3,@(R0,R4)") "L1:\n" S(
+                                            ".DATA.L     H'80000000")
+                                            S(".DATA.L     H'00000020")
+                                                S(".DATA.L     H'00007FF3"),
+        // 5.0 R26 -optimize=0 -fpu=single -denormalize=on, a loop's p[i] =
+        // 1.794e-43f; q[i] = 128;
+        S("MOV.L       @R15,R1") S("SHLL2       R1")
+            S("MOV.L       @(8,R15),R0") S("MOV.L       L1+4,R2")
+                S("LDS         R2,FPUL") S("FSTS        FPUL,FR3")
+                    S("FMOV.S      FR3,@(R0,R1)") S("MOV.L       @R15,R3")
+                        S("SHLL2       R3") S("MOV.L       @(4,R15),R0")
+                            S("MOV.W       L1,R2") S("RTS")
+                                S("MOV.L       R2,@(R0,R3)") "L1:\n" S(
+                                    ".DATA.W     H'0080") S(".RES.W      1")
+                                    S(".DATA.L     H'00000080"),
+    };
+    for (size_t i = 0; i < sizeof compiled / sizeof compiled[0]; i++) {
+        (void)snprintf(in, sizeof in, F("%s"), compiled[i]);
+        CHECK(inspects(in, SHCKIT_SZ_0, "none"));
+    }
+    // 5.1 R13 -cpu=sh4 -pic=1: a call through a function's address, its
+    // distance from L2 added to MOVA's
+    CHECK(INSPECTS(
+        S("MOVA        L2,R0") S("MOV.L       L1,R14") S("STS.L       PR,@-R15")
+            S("ADD         R0,R14") "L2:\n" S("JSR         @R14")
+                S("MOV         #127,R4") S("LDS.L       @R15+,PR") S("RTS")
+                    S("NOP") "L1:\n" S(".DATA.L     _gs-L2"),
+        "none; call 7"));
 }
 
 static void test_inspect_labels(void)
@@ -3228,37 +3636,38 @@ static void test_inspect_labels(void)
     // a ?label read in its block, as asmsh reads it: from a .SECTION line,
     // or from the first definition of a name other than a ?label, alone or
     // on an instruction or data, up to the next such line. A name defined
-    // more than once there is its first definition.
+    // more than once there is its first definition. _g's ?k is H'1000, which
+    // its DT reads as an integer.
     static const char twice[] =
         "_f:\n" S("NOP") S("MOV.L       ?k,R4") "?top:\n" S("DT          R4")
             S("BF          ?top") S("RTS")
-                S("NOP") "?k:\n" S(".DATA.L     0") "_g:\n" S(
+                S("NOP") "?k:\n" S(".DATA.L     -1") "_g:\n" S(
                     "MOV.L       ?k,R4") "?top:\n" S("DT          R4")
                     S("BF          ?top") S("RTS")
                         S("NOP") "?k:\n" S(".DATA.L     H'1000");
-    CHECK(inspects_lines(twice, 0, 11, R10, OBJ, UNKNOWN,
-                         "operand small-constant 3 #0"));
-    CHECK(inspects_lines(twice, 11, 0, R10, OBJ, UNKNOWN, "none"));
-    CHECK(inspects_lines(twice, 11, 0, R10, ASM, UNKNOWN, "none"));
+    CHECK(
+        inspects_lines(twice, 0, 11, UNKNOWN, "operand small-constant 3 #-1"));
+    CHECK(inspects_lines(twice, 11, 0, UNKNOWN,
+                         "operand integer-constant 12 #4096"));
     CHECK(inspects(F(S("MOV.L       ?k,R4") S("RTS") S("NOP") "?k:\n" S(
-                       ".DATA.L     0") "X:        .EQU        1\n"
-                                        "?k:\n" S(".DATA.L     H'1000")),
-                   R10, OBJ, UNKNOWN, "operand small-constant 2 #0"));
+                       ".DATA.L     -1") "X:        .EQU        1\n"
+                                         "?k:\n" S(".DATA.L     H'1000")),
+                   UNKNOWN, "operand small-constant 2 #-1"));
     CHECK(inspects(
-        F(S("MOV.L       ?k,R4") S("RTS") S("NOP") "?k:\n" S(".DATA.L     0")
-              S(".SECTION    Q,CODE,ALIGN=4") "?k:\n" S(".DATA.L     0")),
-        R10, OBJ, UNKNOWN, "operand small-constant 2 #0"));
+        F(S("MOV.L       ?k,R4") S("RTS") S("NOP") "?k:\n" S(".DATA.L     -1")
+              S(".SECTION    Q,CODE,ALIGN=4") "?k:\n" S(".DATA.L     -1")),
+        UNKNOWN, "operand small-constant 2 #-1"));
     CHECK(inspects(F(S("BRA         ?top") S("NOP") "?top:\n" S("RTS")
                          S("ADD         #8,R15") "_g:\n"
                                                  "?top:\n" S("NOP")),
-                   R10, ASM, SHCKIT_SZ_0, "abi stack-above-entry 6 +8"));
+                   SHCKIT_SZ_0, "abi return-above-entry 6 +8"));
     CHECK(
         inspects(F(S("BRA         ?top") S("NOP") "_g:\n"
                                                   "?top:\n" S("RTS") S("NOP")),
-                 R10, ASM, SHCKIT_SZ_0, "none; branch-target 2"));
+                 SHCKIT_SZ_0, "none; branch-target 2"));
     CHECK(INSPECTS(S("BRA         ?a") S("NOP") "?a:\n" S("RTS")
                        S("ADD         #8,R15") "?a:\n" S("RTS") S("NOP"),
-                   "abi stack-above-entry 6 +8"));
+                   "abi return-above-entry 6 +8"));
     CHECK(INSPECTS(S("BRA         ?a") S("NOP") "?a:\n" S("RTS")
                        S("NOP") "?a:\n" S("RTS") S("ADD         #8,R15"),
                    "none"));
@@ -3292,18 +3701,17 @@ static void test_inspect_labels(void)
     char in[512];
     for (size_t i = 0; i < sizeof opens / sizeof opens[0]; i++) {
         (void)snprintf(in, sizeof in, between, opens[i]);
-        CHECK(inspects_lines(in, 5, 0, R10, ASM, UNKNOWN,
-                             "abi stack-above-entry 10 +8"));
+        CHECK(
+            inspects_lines(in, 5, 0, UNKNOWN, "abi return-above-entry 10 +8"));
     }
     // without one, the branch's ?a is the one above, out of the function
     for (size_t i = 0; i < sizeof stays / sizeof stays[0]; i++) {
         (void)snprintf(in, sizeof in, between, stays[i]);
-        CHECK(inspects_lines(in, 5, 0, R10, ASM, UNKNOWN, "none"));
+        CHECK(inspects_lines(in, 5, 0, UNKNOWN, "none"));
     }
     // a label on .ALIGN defines nothing, so the _x below it is the first
     (void)snprintf(in, sizeof in, between, "_x:       .ALIGN      4\n_x:\n");
-    CHECK(inspects_lines(in, 6, 0, R10, ASM, UNKNOWN,
-                         "abi stack-above-entry 11 +8"));
+    CHECK(inspects_lines(in, 6, 0, UNKNOWN, "abi return-above-entry 11 +8"));
 
     // no definition: a label on a directive but data, .POOL, .EQU and
     // .ASSIGN, a ?label on .EQU or .ASSIGN, and a name asmsh refuses. It
@@ -3312,9 +3720,9 @@ static void test_inspect_labels(void)
                        "RTS") S("ADD         #8,R15"),
                    "none; branch-target 2"));
     CHECK(INSPECTS(S("MOV.L       #?z,R4") S("RTS")
-                       S("NOP") "?z:       .EQU        0\n",
+                       S("NOP") "?z:       .EQU        -1\n",
                    "none"));
-    CHECK(INSPECTS("?z:       .ASSIGN     0\n" S("MOV.L       #?z,R4") S("RTS")
+    CHECK(INSPECTS("?z:       .ASSIGN     -1\n" S("MOV.L       #?z,R4") S("RTS")
                        S("NOP"),
                    "none"));
 
@@ -3324,10 +3732,10 @@ static void test_inspect_labels(void)
                        "RTS") S("ADD         #8,R15"),
                    "none; branch-target 2"));
     CHECK(INSPECTS("_t:       .ASSIGN     4\n" S("RTS") S("ADD         #8,R15"),
-                   "abi stack-above-entry 4 +8"));
+                   "abi return-above-entry 4 +8"));
     CHECK(INSPECTS(S("BRA         ?$a") S("NOP") "?$a:\n" S("RTS")
                        S("ADD         #8,R15"),
-                   "abi stack-above-entry 6 +8"));
+                   "abi return-above-entry 6 +8"));
     static const char *const refused[] = {
         "?abcdefghijklmnop", "?", "?a?b", "_a?b", "_a.b",
     };
@@ -3338,17 +3746,17 @@ static void test_inspect_labels(void)
         "$x",
     };
     static const char word[] = F(S("MOV.L       %s,R4") S("RTS") S("NOP") S(
-        ".ALIGN      4") "%s:\n" S(".DATA.L     0"));
+        ".ALIGN      4") "%s:\n" S(".DATA.L     -1"));
     for (size_t i = 0; i < sizeof refused / sizeof refused[0]; i++) {
         (void)snprintf(in, sizeof in, word, refused[i], refused[i]);
-        CHECK(inspects(in, R10, OBJ, UNKNOWN, "none; pool-word 2"));
+        CHECK(inspects(in, UNKNOWN, "none; pool-word 2"));
     }
     for (size_t i = 0; i < sizeof taken / sizeof taken[0]; i++) {
         (void)snprintf(in, sizeof in, word, taken[i], taken[i]);
-        CHECK(inspects(in, R10, OBJ, UNKNOWN, "operand small-constant 2 #0"));
+        CHECK(inspects(in, UNKNOWN, "operand small-constant 2 #-1"));
     }
 
-    // a small pool word whose run of data the text names may be a variable:
+    // a negative pool word whose run of data the text names may be a variable:
     // a label of the run, up to its last data line, that .EXPORT, MOVA, a
     // .DATA item or #label names. A run holds any line but an instruction,
     // .SECTION and .END, and a repeated name names its first definition.
@@ -3358,50 +3766,50 @@ static void test_inspect_labels(void)
         const char *after;
         const char *want;
     } words[] = {
-        {"", "?k:       .DATA.L     0\n", "", "operand small-constant 2 #0"},
-        {S(".EXPORT     _f"), "?k:       .DATA.L     0\n", "",
-         "operand small-constant 3 #0"},
+        {"", "?k:       .DATA.L     -1\n", "", "operand small-constant 2 #-1"},
+        {S(".EXPORT     _f"), "?k:       .DATA.L     -1\n", "",
+         "operand small-constant 3 #-1"},
         {S(".EXPORT     _v"),
-         "?k:       .DATA.L     0\n_v:       .DATA.L     1\n", "",
+         "?k:       .DATA.L     -1\n_v:       .DATA.L     1\n", "",
          "none; pool-word 3"},
-        {"", "?k:       .DATA.L     0\n", S("MOVA        ?k,R0"),
+        {"", "?k:       .DATA.L     -1\n", S("MOVA        ?k,R0"),
          "none; pool-word 2"},
-        {"", "?k:       .DATA.L     0\n", S("MOV.L       #?k,R5"),
+        {"", "?k:       .DATA.L     -1\n", S("MOV.L       #?k,R5"),
          "none; pool-word 2"},
-        {"", "?k:       .DATA.L     0\n", S(".DATA.L     ?k"),
+        {"", "?k:       .DATA.L     -1\n", S(".DATA.L     ?k"),
          "none; pool-word 2"},
-        {"", "?j:       .DATA.L     H'1000\n?k:       .DATA.L     0\n",
+        {"", "?j:       .DATA.L     H'1000\n?k:       .DATA.L     -1\n",
          S("MOVA        ?j,R0"), "none; pool-word 2"},
-        {"", "?k:       .DATA.L     0\n_h:\n", S("MOVA        _h,R0"),
-         "operand small-constant 2 #0"},
-        {"", "?k:       .DATA.L     0\n",
+        {"", "?k:       .DATA.L     -1\n_h:\n", S("MOVA        _h,R0"),
+         "operand small-constant 2 #-1"},
+        {"", "?k:       .DATA.L     -1\n",
          S("MOV.W       ?k,R5") S("MOV.L       ?k,R6"),
-         "operand small-constant 2 #0"},
-        {"", "?k:       .DATA.L     0\n",
+         "operand small-constant 2 #-1"},
+        {"", "?k:       .DATA.L     -1\n",
          "_g:\n" S("MOVA        ?k,R0") S("RTS")
              S("NOP") "?k:       .DATA.L     1\n",
-         "operand small-constant 2 #0"},
+         "operand small-constant 2 #-1"},
         {"",
-         "?k:       .DATA.L     0\n" S(
+         "?k:       .DATA.L     -1\n" S(
              ".EXPORT     _v") "_v:       .DATA.L     1\n",
          "", "none; pool-word 2"},
         {S(".EXPORT     _v"),
-         "?k:       .DATA.L     0\n_n:       .EQU        4\n"
+         "?k:       .DATA.L     -1\n_n:       .EQU        4\n"
          "_v:       .DATA.L     1\n",
          "", "none; pool-word 3"},
         {S(".EXPORT     _v"),
-         "?k:       .DATA.L     0\n" S(
+         "?k:       .DATA.L     -1\n" S(
              ".DATA.L     1,") "+         2\n"
                                "_v:       .DATA.L     3\n",
          "", "none; pool-word 3"},
         {S(".EXPORT     _v"),
-         "?k:       .DATA.L     0\n" S(".POOL") "_v:       .DATA.L     1\n", "",
-         "none; pool-word 3"},
+         "?k:       .DATA.L     -1\n" S(".POOL") "_v:       .DATA.L     1\n",
+         "", "none; pool-word 3"},
         {S(".EXPORT     _v"),
-         "?k:       .DATA.L     0\n" S("RTS")
+         "?k:       .DATA.L     -1\n" S("RTS")
              S("NOP") "_v:       .DATA.L     1\n",
-         "", "operand small-constant 3 #0"},
-        {"", "?k:\n?v:       .DATA.L     0\n",
+         "", "operand small-constant 3 #-1"},
+        {"", "?k:\n?v:       .DATA.L     -1\n",
          S(".DATA.L     ?v") S("RTS") S("NOP") "?v:       .DATA.L     2\n",
          "none; pool-word 2"},
     };
@@ -3410,22 +3818,22 @@ static void test_inspect_labels(void)
                        "%s_f:\n" S("MOV.L       ?k,R4") S("RTS") S("NOP")
                            S(".ALIGN      4") "%s%s",
                        words[i].before, words[i].pool, words[i].after);
-        CHECK(inspects_lines(in, words[i].before[0] != '\0' ? 1 : 0, 0, R10,
-                             OBJ, UNKNOWN, words[i].want));
+        CHECK(inspects_lines(in, words[i].before[0] != '\0' ? 1 : 0, 0, UNKNOWN,
+                             words[i].want));
     }
     CHECK(INSPECTS(
         S("MOV.L       ?k,R4") S("RTS") S("NOP") S(
             ".ALIGN      4") "?v:       .DATA.L     1\n" S("RTS") S("NOP")
             S(".ALIGN      4") "?k:\n"
-                               "?v:       .DATA.L     0\n" S(".DATA.L     ?v"),
-        "operand small-constant 2 #0"));
+                               "?v:       .DATA.L     -1\n" S(".DATA.L     ?v"),
+        "operand small-constant 2 #-1"));
 
     // a variable's word loaded into R15 hides no stack-written witness
     CHECK(inspects(F(S("MOV.L       _v,R15") S("RTS") S("NOP") "_v:\n" S(
-                       ".DATA.L     0") S(".EXPORT     _v")),
-                   R10, OBJ, UNKNOWN, "abi stack-written 2; pool-word 2"));
+                       ".DATA.L     -1") S(".EXPORT     _v")),
+                   UNKNOWN, "abi stack-written 2; pool-word 2"));
 
-    // thousands of small words in one run, which a scan of the text for
+    // thousands of negative words in one run, which a scan of the text for
     // each word's labels would take hours over
     enum { WORDS = 2000 };
     size_t size = (WORDS * 64) + 64;
@@ -3442,9 +3850,9 @@ static void test_inspect_labels(void)
                                 S("RTS") S("NOP") S(".ALIGN      4"));
         for (size_t i = 0; i < WORDS; i++) {
             len += (size_t)snprintf(many + len, size - len,
-                                    "?k%zu:\n" S(".DATA.L     0"), i);
+                                    "?k%zu:\n" S(".DATA.L     -1"), i);
         }
-        CHECK(inspects(many, R10, OBJ, UNKNOWN, "operand small-constant 2 #0"));
+        CHECK(inspects(many, UNKNOWN, "operand small-constant 2 #-1"));
         free(many);
     }
 }
@@ -3477,16 +3885,14 @@ static void test_inspect_stack_written(void)
                        F(S("RTS") S("NOP") "_dead:\n" S("%s") S("RTS")
                              S("NOP") "L1:\n" S(".DATA.L     _stack")),
                        written[i]);
-        CHECK(inspects(in, R10, OBJ | ASM, UNKNOWN, "abi stack-written 5"));
-        CHECK(inspects(in, R32, ASM, SHCKIT_SZ_0,
-                       "abi stack-written 5; abi-scope"));
-        CHECK(inspects(in, "5.0R26", OBJ, UNKNOWN, "none; rule-scope 5"));
+        CHECK(inspects(in, UNKNOWN, "abi stack-written 5"));
+        CHECK(inspects(in, SHCKIT_SZ_0, "abi stack-written 5"));
     }
     for (size_t i = 0; i < sizeof kept / sizeof kept[0]; i++) {
         (void)snprintf(
             in, sizeof in,
             F(S("RTS") S("NOP") "_dead:\n" S("%s") S("RTS") S("NOP")), kept[i]);
-        CHECK(inspects(in, R10, OBJ, SHCKIT_SZ_0, "none"));
+        CHECK(inspects(in, SHCKIT_SZ_0, "none"));
     }
 
     // SHC's stack switch for #pragma interrupt(f(sp=x)): each load of R0
@@ -3502,6 +3908,15 @@ static void test_inspect_stack_written(void)
         S("MOV.W       @(4,PC),R0"),
         S("STC         GBR,R0") S("ADD         #_v-(STARTOF $G0),R0"),
         S("MOV.L       @(_p-(STARTOF $G0),GBR),R0"),
+        // 5.1 R13 -extra=a=1000, which builds a 16-bit x from MOV #imm:
+        // sp=0x80, 0x104, 0x100, 0x101, 0x7f80 and 0x7fff
+        S("MOV         #-128,R0") S("EXTU.B      R0,R0"),
+        S("MOV         #65,R0") S("SHLL2       R0"),
+        S("MOV         #1,R0") S("SHLL8       R0"),
+        S("MOV         #1,R0") S("SHLL8       R0") S("ADD         #1,R0"),
+        S("MOV         #127,R0") S("SHLL8       R0") S("ADD         #127,R0")
+            S("ADD         #1,R0"),
+        S("MOV         #-128,R0") S("SHLL8       R0") S("NOT         R0,R0"),
     };
     static const char tail[] =
         S("MOV.L       @R15+,R15") S("MOV.L       @R15+,R0");
@@ -3519,8 +3934,7 @@ static void test_inspect_stack_written(void)
                   S("MOV         R0,R15") "%s" S("RTE") S("NOP") "%s"),
             loads[i], tail, stack);
         (void)snprintf(want, sizeof want, "none; stack-unknown %zu", lines + 4);
-        CHECK(inspects(in, R10, OBJ | ASM, SHCKIT_SZ_0, want));
-        CHECK(inspects(in, R32, OBJ | ASM, SHCKIT_SZ_0, "none; abi-scope"));
+        CHECK(inspects(in, SHCKIT_SZ_0, want));
     }
     (void)snprintf(
         in, sizeof in,
@@ -3529,7 +3943,7 @@ static void test_inspect_stack_written(void)
                   S("MOV         R0,R15") S("MOV.L       R1,@-R15")
                       S("MOV.L       @R15+,R1") "%s" S("TRAPA       #6")),
         "; the new stack\n", tail);
-    CHECK(inspects(in, R10, ASM, UNKNOWN, "none; stack-unknown 6"));
+    CHECK(inspects(in, UNKNOWN, "none; stack-unknown 6"));
     (void)snprintf(
         in, sizeof in,
         F(S("MOV.L       R0,@-R15")
@@ -3537,37 +3951,104 @@ static void test_inspect_stack_written(void)
                   S("MOV         R0,R15") S("MOV.L       R1,@-R15")
                       S("MOV.L       @R15+,R1") "%s" S("TRAPA       #6")),
         "STACK:    .ASSIGN     H'8C100000\n", tail);
-    CHECK(inspects(in, R10, ASM, UNKNOWN, "none; stack-unknown 6"));
+    CHECK(inspects(in, UNKNOWN, "none; stack-unknown 6"));
     CHECK(inspects(
         F(S(".EXPORT     _f") "_g:\n" S("MOV         R0,@-R15")
               S("MOV         L1,R0") S("MOV         R15,@-R0")
                   S("MOV         R0,R15") S("MOV         @R15+,R15")
                       S(".EXPORT     _g") S("MOV         @R15+,R0") S("RTE")
                           S("NOP") "L1:\n" S(".DATA.L     H'8C100000")),
-        R10, OBJ, UNKNOWN, "none; stack-unknown 7"));
+        UNKNOWN, "none; stack-unknown 7"));
 
-    // a switch that isn't SHC's: not at the entry, loading R0 from a general
-    // register, or switching back where RTE doesn't follow
+    // SHC's scheduler putting what it hasn't issued above the head, under
+    // 5.1 R13 for #pragma interrupt(i(sp=0x8c000000)), seventeen divisions,
+    // cut down: a pop of FPSCR, a store and FDIVs
+    static const char *const lifted[] = {
+        S("FDIV        FR3,FR4") S("FDIV        FR3,FR4"),
+        S("LDS.L       @R15+,FPSCR") S("FMOV.S      FR4,@R5")
+            S("FDIV        FR3,FR4"),
+    };
+    for (size_t i = 0; i < sizeof lifted / sizeof lifted[0]; i++) {
+        char want[64];
+        (void)snprintf(in, sizeof in,
+                       F("%s" S("MOV.L       R0,@-R15") S("MOV.L       L1,R0")
+                             S("MOV.L       R15,@-R0")
+                                 S("MOV         R0,R15") "%s" S("RTE")
+                                     S("NOP") "%s"),
+                       lifted[i], tail, stack);
+        (void)snprintf(want, sizeof want, "none; stack-unknown %d",
+                       i == 0 ? 7 : 8);
+        CHECK(inspects(in, SHCKIT_SZ_0, want));
+    }
+
+    // an instruction above the head with a continuation, which no rule reads
+    (void)snprintf(in, sizeof in,
+                   F(S("MOV.L       R1,") "+                     @R2\n" S(
+                       "MOV.L       R0,@-R15") S("MOV.L       L1,R0")
+                         S("MOV.L       R15,@-R0") S(
+                             "MOV         R0,R15") "%s" S("RTE") S("NOP") "%s"),
+                   tail, stack);
+    CHECK(inspects(in, SHCKIT_SZ_0, "none; continued 2"));
+
+    // the scheduler parting MOV.L @R15+,R15 from the pops around it, under
+    // 5.1 R13 for forty divisions, cut down, and with TRAPA under tn=
+    (void)snprintf(in, sizeof in,
+                   F(S("MOV.L       R0,@-R15") S("MOV.L       L1,R0") S(
+                       "MOV.L       R15,@-R0") S("MOV         R0,R15")
+                         S("MOV.L       R5,@-R15") S("STS.L       FPSCR,@-R15")
+                             S("MOV.L       @R15+,R5") S("MOV.L       @R15+,R0")
+                                 S("MOV.L       @R15+,R15")
+                                     S("LDS.L       @R15+,FPSCR") S("RTE")
+                                         S("NOP") "%s"),
+                   stack);
+    CHECK(inspects(in, SHCKIT_SZ_0, "none; stack-unknown 5"));
+    (void)snprintf(
+        in, sizeof in,
+        F(S("MOV.L       R0,@-R15") S("MOV.L       L1,R0")
+              S("MOV.L       R15,@-R0") S("MOV         R0,R15")
+                  S("MOV.L       @R15+,R5") S("MOV.L       @R15+,R15")
+                      S("MOV.L       @R15+,R4") S("TRAPA       #9") "%s"),
+        stack);
+    CHECK(inspects(in, SHCKIT_SZ_0, "none; stack-unknown 5"));
+
+    // a switch that isn't SHC's: below a branch, loading R0 from a general
+    // register, building it by a step SHC doesn't write or before any load,
+    // or writing R15 other than by MOV.L @R15+,R15 past its head
     static const struct {
         const char *head;
         const char *tail;
         const char *want;
     } others[] = {
-        {S("NOP") S("MOV.L       R0,@-R15") S("MOV.L       L1,R0"), tail,
-         "abi stack-written 6; stack-unknown 6"},
+        {S("BT          _t") "_t:\n" S("MOV.L       R0,@-R15")
+             S("MOV.L       L1,R0"),
+         tail, "abi stack-written 7; stack-unknown 7"},
         {S("MOV.L       R0,@-R15") S("MOV.L       @R0,R0"), tail,
          "abi stack-written 5; stack-unknown 5"},
         {S("MOV.L       R0,@-R15") S("ADD         #4,R0"), tail,
          "abi stack-written 5; stack-unknown 5"},
         {S("MOV.L       R0,@-R15") S("MOV         R4,R0"), tail,
          "abi stack-written 5; stack-unknown 5"},
+        {S("MOV.L       R0,@-R15") S("SHLL8       R0"), tail,
+         "abi stack-written 5; stack-unknown 5"},
+        {S("MOV.L       R0,@-R15") S("EXTU.B      R0,R0"), tail,
+         "abi stack-written 5; stack-unknown 5"},
+        {S("MOV.L       R0,@-R15") S("MOV         #1,R0") S("SHLL16      R0"),
+         tail, "abi stack-written 6; stack-unknown 6"},
+        {S("MOV.L       R0,@-R15") S("MOV         #1,R0") S("SHLL8       R4"),
+         tail, "abi stack-written 6; stack-unknown 6"},
+        {S("MOV.L       R0,@-R15") S("MOV         #-1,R0")
+             S("EXTU.W      R0,R0"),
+         tail, "abi stack-written 6; stack-unknown 6"},
+        {S("MOV.L       R0,@-R15") S("MOV         #-1,R0")
+             S("NOT         R4,R0"),
+         tail, "abi stack-written 6; stack-unknown 6"},
         {S("MOV.L       R0,@-R15"), tail,
          "abi stack-written 4; stack-unknown 4"},
         {S("MOV.L       R0,@-R15") S("MOV.L       L1,R0"),
-         S("MOV.L       @R15+,R15") S("NOP") S("MOV.L       @R15+,R0"),
+         S("MOV.L       @R15,R15") S("MOV.L       @R15+,R0"),
          "abi stack-written 6; stack-unknown 5"},
         {S("MOV.L       R0,@-R15") S("MOV.L       L1,R0"),
-         S("MOV.L       @R15+,R15") S("MOV.L       @R15+,R0") S("NOP"),
+         S("MOV         R4,R15") S("MOV.L       @R15+,R0"),
          "abi stack-written 6; stack-unknown 5"},
     };
     for (size_t i = 0; i < sizeof others / sizeof others[0]; i++) {
@@ -3575,13 +4056,13 @@ static void test_inspect_stack_written(void)
                        F("%s" S("MOV.L       R15,@-R0") S(
                            "MOV         R0,R15") "%s" S("RTE") S("NOP") "%s"),
                        others[i].head, others[i].tail, stack);
-        CHECK(inspects(in, R10, ASM, UNKNOWN, others[i].want));
+        CHECK(inspects(in, UNKNOWN, others[i].want));
     }
     (void)snprintf(in, sizeof in,
                    F(S("JSR         @R4") S("NOP")
                          S("MOV         R0,R15") "%s" S("RTE") S("NOP")),
                    tail);
-    CHECK(inspects(in, R10, ASM, UNKNOWN, "abi stack-written 4; call 2"));
+    CHECK(inspects(in, UNKNOWN, "abi stack-written 4; call 2"));
 }
 
 static void test_inspect_fpscr(void)
@@ -3589,8 +4070,7 @@ static void test_inspect_fpscr(void)
     // FPSCR's push or pop through R15 in a function that holds an RTS, a
     // witness at its line: each alone, in any case, without a size, through
     // SP, in a slot, where control never goes, past a call, and with the RTS
-    // where control never goes. Under a release the reading doesn't cover,
-    // rule-scope there.
+    // where control never goes
     static const struct {
         const char *in;
         size_t line;
@@ -3623,23 +4103,15 @@ static void test_inspect_fpscr(void)
     };
     static const int szs[] = {UNKNOWN, SHCKIT_SZ_0, SHCKIT_SZ_1};
     char want[64];
-    char scoped[64];
     for (size_t i = 0; i < sizeof saves / sizeof saves[0]; i++) {
         (void)snprintf(want, sizeof want, "abi fpscr-save %zu%s", saves[i].line,
                        saves[i].after);
-        (void)snprintf(scoped, sizeof scoped, "none; rule-scope %zu",
-                       saves[i].line);
         for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
-            CHECK(inspects(saves[i].in, R10, OBJ, szs[j], want));
-            CHECK(inspects(saves[i].in, R10, ASM, szs[j], want));
-            CHECK(inspects(saves[i].in, R10, OBJ | ASM, szs[j], want));
+            CHECK(inspects(saves[i].in, szs[j], want));
         }
-        CHECK(inspects(saves[i].in, R32, OBJ | ASM, UNKNOWN, scoped));
-        CHECK(inspects(saves[i].in, "5.1R13", ASM, UNKNOWN, scoped));
-        CHECK(inspects(saves[i].in, "6.0C.001", OBJ, UNKNOWN, scoped));
     }
 
-    // a pop above the entry, which stack-above-entry witnesses at the same
+    // a pop above the entry, which return-above-entry witnesses at the same
     // line, listed after it; an opcode outranks it
     CHECK(INSPECTS(S("FMOV.S      @R4,FR2") S("LDS.L       @R15+,FPSCR")
                        S("RTS") S("NOP"),
@@ -3687,10 +4159,8 @@ static void test_inspect_fpscr(void)
          "none; opaque-transfer 4"},
     };
     for (size_t i = 0; i < sizeof others / sizeof others[0]; i++) {
-        CHECK(inspects(others[i].in, R10, OBJ | ASM, SHCKIT_SZ_0,
-                       others[i].want));
-        CHECK(inspects(others[i].in, R10, OBJ | ASM, SHCKIT_SZ_1,
-                       others[i].want));
+        CHECK(inspects(others[i].in, SHCKIT_SZ_0, others[i].want));
+        CHECK(inspects(others[i].in, SHCKIT_SZ_1, others[i].want));
     }
 }
 
@@ -3753,10 +4223,8 @@ static void test_inspect_fpscr_compiled(void)
          "none; stack-unknown 16"},
     };
     for (size_t i = 0; i < sizeof compiled / sizeof compiled[0]; i++) {
-        CHECK(inspects(compiled[i].in, R10, OBJ | ASM, SHCKIT_SZ_0,
-                       compiled[i].want));
-        CHECK(inspects(compiled[i].in, R10, OBJ | ASM, SHCKIT_SZ_1,
-                       compiled[i].want));
+        CHECK(inspects(compiled[i].in, SHCKIT_SZ_0, compiled[i].want));
+        CHECK(inspects(compiled[i].in, SHCKIT_SZ_1, compiled[i].want));
     }
 
     // #pragma interrupt(i_tn(tn=5)) void i_tn(void) { g(); }, cut down, and
@@ -3769,9 +4237,8 @@ static void test_inspect_fpscr_compiled(void)
                     S("LDS.L       @R15+,FPUL") S("LDS.L       @R15+,PR")
                         S("MOV.L       @R15+,R0") S("TRAPA       #5") "L1:\n" S(
                             ".DATA.L     _g") "_f:\n" S("RTS") S("NOP");
-    CHECK(inspects_lines(tn, 1, 16, R10, OBJ | ASM, UNKNOWN, "none; call 8"));
-    CHECK(inspects_lines(tn, 1, 0, R10, OBJ | ASM, UNKNOWN,
-                         "abi fpscr-save 6; call 8"));
+    CHECK(inspects_lines(tn, 1, 16, UNKNOWN, "none; call 8"));
+    CHECK(inspects_lines(tn, 1, 0, UNKNOWN, "abi fpscr-save 6; call 8"));
 
     // FPSCR kept across a call as the text of a function written in
     // assembly keeps it, cut down: through R0, a push and a pop of the copy,
@@ -3787,100 +4254,101 @@ static void test_inspect_fpscr_compiled(void)
 
 static void test_inspect_stack(void)
 {
-    // R15 above its entry value after any step the stack rule reaches, and
-    // below it once an RTS's slot has run: at the entry, above it and below
-    // it
+    // R15 above its entry value once a return's slot has run, and below it
+    // once an RTS's slot has: at the entry, above it and below it. R15 above
+    // the entry on the way shows nothing, since SHC's scheduler can put a
+    // pop there.
     CHECK(INSPECTS(S("RTS") S("NOP"), "none"));
     CHECK(INSPECTS(S("RTS") S("ADD         #8,R15"),
-                   "abi stack-above-entry 3 +8"));
+                   "abi return-above-entry 3 +8"));
     CHECK(INSPECTS(S("RTS") S("ADD         #-8,R15"),
                    "abi return-below-entry 3 -8"));
     CHECK(INSPECTS(S("ADD         #4,R15") S("ADD         #-4,R15") S("RTS")
                        S("NOP"),
-                   "abi stack-above-entry 2 +4"));
-    CHECK(inspects(F(S("RTS") S("ADD         #8,R15")), R32, OBJ | ASM, UNKNOWN,
-                   "none; abi-scope"));
+                   "none"));
+    CHECK(INSPECTS(S("ADD         #4,R15") S("RTE") S("NOP"),
+                   "abi return-above-entry 4 +4"));
 
     // pushes and pops, by size, through R15 or its alias SP, with asmsh's
     // size where none is written
     CHECK(INSPECTS(S("MOV.L       R8,@-R15") S("RTS") S("MOV.L       @R15+,R8"),
                    "none"));
     CHECK(INSPECTS(S("MOV         R8,@-R15") S("RTS") S("ADD         #8,R15"),
-                   "abi stack-above-entry 4 +4"));
+                   "abi return-above-entry 4 +4"));
     CHECK(INSPECTS(S("RTS") S("MAC         @R15+,@R15+"),
-                   "abi stack-above-entry 3 +4"));
+                   "abi return-above-entry 3 +4"));
     CHECK(INSPECTS(S("MOV.L       R8,@-SP") S("RTS") S("ADD         #8,SP"),
-                   "abi stack-above-entry 4 +4"));
+                   "abi return-above-entry 4 +4"));
     CHECK(INSPECTS(S("RTS") S("MOV.W       @SP+,R4"),
-                   "abi stack-above-entry 3 +2"));
+                   "abi return-above-entry 3 +2"));
     CHECK(INSPECTS(S("RTS") S("MOV.B       @SP+,R4"),
-                   "abi stack-above-entry 3 +1"));
+                   "abi return-above-entry 3 +1"));
     CHECK(INSPECTS(S("RTS") S("MAC.L       @R15+,@R15+"),
-                   "abi stack-above-entry 3 +8"));
+                   "abi return-above-entry 3 +8"));
     CHECK(INSPECTS(S("RTS") S("MAC.W       @R15+,@R15+"),
-                   "abi stack-above-entry 3 +4"));
+                   "abi return-above-entry 3 +4"));
     CHECK(INSPECTS(S("RTS") S("STC.L       SR,@-R15"),
                    "abi return-below-entry 3 -4"));
     CHECK(INSPECTS(S("RTS") S("LDS.L       @R15+,FPUL"),
-                   "abi stack-above-entry 3 +4"));
+                   "abi return-above-entry 3 +4"));
     CHECK(INSPECTS(S("LDS.L       @R15+,PR") S("RTS") S("NOP"),
-                   "abi stack-above-entry 2 +4"));
+                   "abi return-above-entry 4 +4"));
 
     // an FMOV through R15 moves 4 or 8 bytes by SZ, which FSCHG flips and a
     // write to FPSCR loses. With SZ unknown, a witness under both names the
     // offset nearer the entry, and a witness under one SZ alone is
     // stack-unknown.
-    CHECK(inspects(F(S("RTS") S("FMOV.S      @R15+,FR4")), R10, ASM,
-                   SHCKIT_SZ_0, "abi stack-above-entry 3 +4"));
-    CHECK(inspects(F(S("RTS") S("FMOV.S      @R15+,FR4")), R10, ASM,
-                   SHCKIT_SZ_1, "abi stack-above-entry 3 +8"));
+    CHECK(inspects(F(S("RTS") S("FMOV.S      @R15+,FR4")), SHCKIT_SZ_0,
+                   "abi return-above-entry 3 +4"));
+    CHECK(inspects(F(S("RTS") S("FMOV.S      @R15+,FR4")), SHCKIT_SZ_1,
+                   "abi return-above-entry 3 +8"));
     CHECK(INSPECTS(S("RTS") S("FMOV.S      @R15+,FR4"),
-                   "abi stack-above-entry 3 +4"));
+                   "abi return-above-entry 3 +4"));
     CHECK(inspects(
         F(S("FMOV.S      FR4,@-R15") S("ADD         #4,R15") S("RTS") S("NOP")),
-        R10, ASM, SHCKIT_SZ_1, "abi return-below-entry 5 -4"));
+        SHCKIT_SZ_1, "abi return-below-entry 5 -4"));
     CHECK(INSPECTS(S("FMOV.S      FR4,@-R15") S("ADD         #4,R15") S("RTS")
                        S("NOP"),
                    "none; stack-unknown 5"));
     CHECK(INSPECTS(S("FMOV.S      FR4,@-R15") S("FMOV.S      FR5,@-R15")
                        S("ADD         #12,R15") S("RTS") S("NOP"),
-                   "none; stack-unknown 4"));
-    CHECK(inspects(F(S("FSCHG") S("RTS") S("FMOV.S      @R15+,FR4")), R10, ASM,
-                   SHCKIT_SZ_0, "abi stack-above-entry 4 +8"));
+                   "none; stack-unknown 6"));
+    CHECK(inspects(F(S("FSCHG") S("RTS") S("FMOV.S      @R15+,FR4")),
+                   SHCKIT_SZ_0, "abi return-above-entry 4 +8"));
     CHECK(inspects(F(S("FSCHG") S("FSCHG") S("RTS") S("FMOV.S      @R15+,FR4")),
-                   R10, ASM, SHCKIT_SZ_0, "abi stack-above-entry 5 +4"));
+                   SHCKIT_SZ_0, "abi return-above-entry 5 +4"));
     CHECK(inspects(
-        F(S("LDS         R4,FPSCR") S("RTS") S("FMOV.S      @R15+,FR4")), R10,
-        ASM, SHCKIT_SZ_0, "none; stack-unknown 4"));
+        F(S("LDS         R4,FPSCR") S("RTS") S("FMOV.S      @R15+,FR4")),
+        SHCKIT_SZ_0, "none; stack-unknown 4"));
 
     // R14 keeps a copy of R15's offset until written, and gives it back
     CHECK(INSPECTS(S("MOV         R15,R14") S("ADD         R4,R15") S(
                        "MOV         R14,R15") S("RTS") S("ADD         #8,R15"),
-                   "abi stack-above-entry 6 +8; stack-unknown 3"));
+                   "abi return-above-entry 6 +8; stack-unknown 3"));
     CHECK(INSPECTS(S("MOV         R15,R14") S("ADD         R4,R15")
                        S("MOV         R4,R14") S("MOV         R14,R15") S("RTS")
                            S("NOP"),
                    "none; stack-unknown 3"));
     CHECK(INSPECTS(S("MOV         R15,R14") S("MOV.L       @R14+,R4")
                        S("MOV         R14,R15") S("RTS") S("NOP"),
-                   "abi stack-above-entry 4 +4"));
+                   "abi return-above-entry 6 +4"));
     CHECK(inspects(F(S("MOV         R15,R14") S("FMOV.S      FR4,@-R15")
                          S("MOV         R14,R15") S("RTS") S("NOP")),
-                   R10, ASM, SHCKIT_SZ_0, "none"));
+                   SHCKIT_SZ_0, "none"));
 
     // what reads R15 without writing it, and what writes another register
     CHECK(INSPECTS(S("CMP/PL      R15") S("CMP/EQ      R14,R15") S(
                        "TST         R15,R15") S("MUL.L       R14,R15")
                        S("STS         PR,R4") S("RTS") S("ADD         #8,R15"),
-                   "abi stack-above-entry 8 +8"));
+                   "abi return-above-entry 8 +8"));
     CHECK(INSPECTS(S("DIV1        R4,R5") S("RTS") S("ADD         #8,R15"),
-                   "abi stack-above-entry 4 +8"));
+                   "abi return-above-entry 4 +8"));
 
     // an ADD of a signed byte, in any of asmsh's radixes
     CHECK(INSPECTS(S("RTS") S("ADD         #H'08,R15"),
-                   "abi stack-above-entry 3 +8"));
+                   "abi return-above-entry 3 +8"));
     CHECK(INSPECTS(S("RTS") S("ADD         #B'1000,R15"),
-                   "abi stack-above-entry 3 +8"));
+                   "abi return-above-entry 3 +8"));
     CHECK(
         INSPECTS(S("RTS") S("ADD         #H'FF,R15"), "none; stack-unknown 3"));
     CHECK(INSPECTS(S("ADD         #_x,R15") S("RTS") S("NOP"),
@@ -3890,13 +4358,13 @@ static void test_inspect_stack(void)
 
     // a write to PR, an expansion, and RTE, which returns
     CHECK(INSPECTS(S("LDS         R4,PR") S("RTS") S("ADD         #8,R15"),
-                   "abi stack-above-entry 4 +8"));
+                   "abi return-above-entry 4 +8"));
     CHECK(INSPECTS(S("MOV.L       #1234,R4") S("MOVA        #1234,R0")
                        S("MOV.W       #1234,R14") S("RTS")
                            S("ADD         #8,R15"),
-                   "abi stack-above-entry 6 +8"));
+                   "abi return-above-entry 6 +8"));
     CHECK(INSPECTS(S("RTE") S("ADD         #8,R15"),
-                   "abi stack-above-entry 3 +8"));
+                   "abi return-above-entry 3 +8"));
 
     // a call, a jump, or an exception
     CHECK(INSPECTS(S("STS.L       PR,@-R15") S("BSR         _g") S("NOP")
@@ -3915,7 +4383,7 @@ static void test_inspect_stack(void)
                    "none; opaque-transfer 2"));
     CHECK(INSPECTS(S("SLEEP") S("RTS") S("NOP"), "none; opaque-transfer 2"));
     CHECK(INSPECTS(S("ADD         #4,R15") S("JMP         @R4") S("NOP"),
-                   "abi stack-above-entry 2 +4; opaque-transfer 3"));
+                   "none; opaque-transfer 3"));
 
     // what the assembler lays out, and a slot it may move
     CHECK(INSPECTS(S(".ALIGN      4") S("RTS") S("ADD         #8,R15"),
@@ -3928,15 +4396,14 @@ static void test_inspect_stack(void)
                    "none; continued 2"));
     CHECK(INSPECTS(S(".EXPORT     _a,") "+           _b\n" S("RTS")
                        S("ADD         #8,R15"),
-                   "abi stack-above-entry 5 +8"));
+                   "abi return-above-entry 5 +8"));
 
     // control past the function's last line, or into .END
     CHECK(INSPECTS(S("NOP"), "none; fallthrough 2"));
     CHECK(INSPECTS(S("NOP") S(".END"), "none; fallthrough 3"));
 
-    // every run of up to four pushes, pops and adjustments: a witness at
-    // the first step that takes R15 above the entry, by the run's sum there,
-    // or else at the return's slot if the run ends below the entry
+    // every run of up to four pushes, pops and adjustments: whatever R15
+    // does on the way, the run's sum says what stands at the return's slot
     static const struct {
         const char *line;
         int bytes;
@@ -3953,24 +4420,17 @@ static void test_inspect_stack(void)
             char in[512];
             char want[64] = "none";
             int sum = 0;
-            bool above = false;
             for (size_t i = 0, at = run; i < length; i++, at /= kinds) {
                 lines[i] = steps[at % kinds].line;
                 sum += steps[at % kinds].bytes;
-                if (sum > 0 && !above) {
-                    (void)snprintf(want, sizeof want,
-                                   "abi stack-above-entry %zu %+d", i + 2, sum);
-                    above = true;
-                }
             }
-            if (sum < 0 && !above) {
-                (void)snprintf(want, sizeof want,
-                               "abi return-below-entry %zu %+d", length + 3,
-                               sum);
+            if (sum != 0) {
+                (void)snprintf(want, sizeof want, "abi return-%s-entry %zu %+d",
+                               sum > 0 ? "above" : "below", length + 3, sum);
             }
             (void)snprintf(in, sizeof in, F("%s%s%s%s" S("RTS") S("NOP")),
                            lines[0], lines[1], lines[2], lines[3]);
-            CHECK(inspects(in, R10, ASM, UNKNOWN, want));
+            CHECK(inspects(in, UNKNOWN, want));
         }
     }
 
@@ -3986,29 +4446,29 @@ static void test_inspect_branches(void)
     CHECK(INSPECTS(S("BRA         _ret") S("ADD         #-8,R15") "_dead:\n" S(
                        "ADD         #8,R15") "_ret:\n" S("RTS")
                        S("ADD         #16,R15"),
-                   "abi stack-above-entry 8 +8"));
+                   "abi return-above-entry 8 +8"));
     CHECK(INSPECTS(
         S("TST         R4,R4") S("BT          _other") S("ADD         #-8,R15")
             S("BRA         _ret")
                 S("NOP") "_other:\n" S("ADD         #-8,R15") "_ret:\n" S("RTS")
                     S("ADD         #12,R15"),
-        "abi stack-above-entry 11 +4"));
+        "abi return-above-entry 11 +4"));
     CHECK(INSPECTS(S("TST         R4,R4") S("BT/S        _ret")
                        S("ADD         #8,R15") "_ret:\n" S("RTS") S("NOP"),
-                   "abi stack-above-entry 4 +8"));
+                   "abi return-above-entry 7 +8"));
     CHECK(INSPECTS(S("TST         R4,R4") S("BF/S        _ret")
                        S("ADD         #-8,R15") "_ret:\n" S("RTS")
                            S("ADD         #12,R15"),
-                   "abi stack-above-entry 7 +4"));
+                   "abi return-above-entry 7 +4"));
 
-    // a branch moves no R15, so one reached above the entry, as the BT on
-    // line 5 is from line 14, is no witness
+    // R15 above the entry across a branch, as at the BT on line 5, from
+    // line 12, shows nothing when each return's slot brings it back
     CHECK(INSPECTS(
         S("BRA         L3") S("NOP") "L1:\n" S("BT          L2") S("RTS")
             S("ADD         #-4,R15") "L2:\n" S("RTS")
                 S("ADD         #-4,R15") "L3:\n" S("MOV.L       @R15+,R1")
                     S("BRA         L1") S("NOP"),
-        "abi stack-above-entry 12 +4"));
+        "none"));
 
     // joins whose offsets disagree, and loops that keep R15 or don't
     CHECK(INSPECTS(S("TST         R4,R4") S("BT          _ret")
@@ -4016,7 +4476,7 @@ static void test_inspect_branches(void)
                    "none; stack-unknown 6"));
     CHECK(INSPECTS(S("TST         R4,R4") S("BT          _ret")
                        S("ADD         #8,R15") "_ret:\n" S("RTS") S("NOP"),
-                   "abi stack-above-entry 4 +8; stack-unknown 6"));
+                   "none; stack-unknown 6"));
     CHECK(INSPECTS("_loop:\n" S("ADD         #-4,R15") S("ADD         #4,R15")
                        S("DT          R4") S("BF          _loop") S("RTS")
                            S("NOP"),
@@ -4048,10 +4508,10 @@ static void test_inspect_branches(void)
                    "none; branch-target 3"));
 
     // a branch out of the function's lines ends its path, past its slot
-    // where it has one, and is no return, but a witness may stand at the
-    // slot: a tail branch, one whose slot leaves R15 below the entry and one
-    // whose slot leaves it above, one to a label above the entry, and a
-    // conditional one, whose other path goes on, past BT/S's slot too
+    // where it has one, and is no return: a tail branch, one whose slot
+    // leaves R15 below the entry and one whose slot leaves it above, one to
+    // a label above the entry, and a conditional one, whose other path goes
+    // on, past BT/S's slot too
     static const struct {
         const char *in;
         size_t first;
@@ -4066,12 +4526,12 @@ static void test_inspect_branches(void)
          0, 3, "none"},
         {F(S("BRA         _g") S("ADD         #4,R15") "_g:\n" S("RTS")
                S("NOP")),
-         0, 3, "abi stack-above-entry 3 +4"},
+         0, 3, "none"},
         {"_g:\n" S("RTS") S("NOP") F(S("BRA         _g") S("NOP")), 3, 0,
          "none"},
         {F(S("TST         R4,R4") S("BT          _g") S("RTS")
                S("ADD         #8,R15") "_g:\n" S("RTS") S("NOP")),
-         0, 5, "abi stack-above-entry 5 +8"},
+         0, 5, "abi return-above-entry 5 +8"},
         {F(S("TST         R4,R4") S("BT/S        _g") S("ADD         #-4,R15")
                S("RTS") S("ADD         #4,R15") "_g:\n" S("RTS") S("NOP")),
          0, 6, "none"},
@@ -4091,8 +4551,8 @@ static void test_inspect_branches(void)
          "none; section-change 6"},
     };
     for (size_t i = 0; i < sizeof out / sizeof out[0]; i++) {
-        CHECK(inspects_lines(out[i].in, out[i].first, out[i].end, R10, ASM,
-                             UNKNOWN, out[i].want));
+        CHECK(inspects_lines(out[i].in, out[i].first, out[i].end, UNKNOWN,
+                             out[i].want));
     }
 
     // a label outside that marks no instruction: data, a directive that
@@ -4107,18 +4567,17 @@ static void test_inspect_branches(void)
         char in[256];
         (void)snprintf(in, sizeof in, F(S("BRA         _g") S("NOP") "_g:\n%s"),
                        unlabelled[i]);
-        CHECK(inspects_lines(in, 0, 3, R10, ASM, UNKNOWN,
-                             "none; branch-target 2"));
+        CHECK(inspects_lines(in, 0, 3, UNKNOWN, "none; branch-target 2"));
     }
 
     // a witness past a branch the rule can't decide, and in a loop that may
     // not end
     CHECK(INSPECTS(S("CMP/EQ      R4,R4") S("BF          _dead") S("RTS")
                        S("NOP") "_dead:\n" S("RTS") S("ADD         #8,R15"),
-                   "abi stack-above-entry 8 +8"));
+                   "abi return-above-entry 8 +8"));
     CHECK(INSPECTS("_loop:\n" S("DT          R4") S("BF          _loop")
                        S("RTS") S("ADD         #8,R15"),
-                   "abi stack-above-entry 6 +8"));
+                   "abi return-above-entry 6 +8"));
 }
 
 static void test_inspect_returns(void)
@@ -4130,11 +4589,8 @@ static void test_inspect_returns(void)
         F(S("MOV.L       R14,@-R15") S("STS.L       PR,@-R15")
               S("ADD         #-8,R15") S("MOV         R4,R0")
                   S("ADD         #8,R15") S("RTS") S("LDS.L       @R15+,PR"));
-    CHECK(inspects(short_pop, R10, OBJ | ASM, UNKNOWN,
-                   "abi return-below-entry 8 -4"));
-    CHECK(inspects(short_pop, R10, OBJ, SHCKIT_SZ_1,
-                   "abi return-below-entry 8 -4"));
-    CHECK(inspects(short_pop, R32, OBJ | ASM, UNKNOWN, "none; abi-scope"));
+    CHECK(inspects(short_pop, UNKNOWN, "abi return-below-entry 8 -4"));
+    CHECK(inspects(short_pop, SHCKIT_SZ_1, "abi return-below-entry 8 -4"));
     CHECK(INSPECTS(S("MOV.L       R14,@-R15") S("STS.L       PR,@-R15")
                        S("ADD         #-8,R15") S("MOV         R4,R0")
                            S("ADD         #8,R15") S("LDS.L       @R15+,PR")
@@ -4159,7 +4615,7 @@ static void test_inspect_returns(void)
     CHECK(INSPECTS(S("TST         R4,R4") S("BT          _other") S("RTS")
                        S("ADD         #4,R15") "_other:\n" S("RTS")
                            S("ADD         #-4,R15"),
-                   "abi stack-above-entry 5 +4"));
+                   "abi return-above-entry 5 +4"));
     CHECK(INSPECTS(S("TST         R4,R4") S("BT          _other") S("RTS")
                        S("ADD         #-4,R15") "_other:\n" S("RTS")
                            S("ADD         #4,R15"),
@@ -4172,16 +4628,12 @@ static void test_inspect_returns(void)
         F(S("FMOV.S      FR12,@-R15") S("RTS") S("NOP"));
     static const char flipped[] = F(S("FMOV.S      FR13,@-R15") S("FSCHG")
                                         S("RTS") S("FMOV.S      @R15+,FR13"));
-    CHECK(inspects(fr_push, R10, ASM, SHCKIT_SZ_0,
-                   "abi return-below-entry 4 -4"));
-    CHECK(inspects(fr_push, R10, ASM, SHCKIT_SZ_1,
-                   "abi return-below-entry 4 -8"));
-    CHECK(inspects(fr_push, R10, ASM, UNKNOWN, "abi return-below-entry 4 -4"));
-    CHECK(inspects(flipped, R10, ASM, SHCKIT_SZ_1,
-                   "abi return-below-entry 5 -4"));
-    CHECK(
-        inspects(flipped, R10, ASM, SHCKIT_SZ_0, "abi stack-above-entry 5 +4"));
-    CHECK(inspects(flipped, R10, ASM, UNKNOWN, "none; stack-unknown 5"));
+    CHECK(inspects(fr_push, SHCKIT_SZ_0, "abi return-below-entry 4 -4"));
+    CHECK(inspects(fr_push, SHCKIT_SZ_1, "abi return-below-entry 4 -8"));
+    CHECK(inspects(fr_push, UNKNOWN, "abi return-below-entry 4 -4"));
+    CHECK(inspects(flipped, SHCKIT_SZ_1, "abi return-below-entry 5 -4"));
+    CHECK(inspects(flipped, SHCKIT_SZ_0, "abi return-above-entry 5 +4"));
+    CHECK(inspects(flipped, UNKNOWN, "none; stack-unknown 5"));
 
     // R15 below the entry before the slot, in the slot by a pop, after RTE,
     // or past a limit is no witness
@@ -4226,13 +4678,12 @@ static void test_inspect_returns(void)
                                        "    FMOV.S      @R0,FR0\n"
                                        "    FRCHG\n" S("RTS") S("NOP");
     CHECK(rewrites(DROP, copied, dropped));
-    CHECK(inspects_lines(copied, 1, 0, R10, ASM, SHCKIT_SZ_0,
-                         "none; assembler-layout 9"));
-    CHECK(inspects_lines(copied, 1, 0, R10, ASM, UNKNOWN,
-                         "none; assembler-layout 9"));
-    CHECK(inspects_lines(dropped, 1, 0, R10, ASM, SHCKIT_SZ_0,
+    CHECK(
+        inspects_lines(copied, 1, 0, SHCKIT_SZ_0, "none; assembler-layout 9"));
+    CHECK(inspects_lines(copied, 1, 0, UNKNOWN, "none; assembler-layout 9"));
+    CHECK(inspects_lines(dropped, 1, 0, SHCKIT_SZ_0,
                          "abi return-below-entry 10 -8"));
-    CHECK(inspects_lines(dropped, 1, 0, R10, ASM, SHCKIT_SZ_1,
+    CHECK(inspects_lines(dropped, 1, 0, SHCKIT_SZ_1,
                          "abi return-below-entry 10 -16"));
 }
 
@@ -4300,9 +4751,7 @@ static void test_inspect_pairs(void)
     static const int szs[] = {UNKNOWN, SHCKIT_SZ_0, SHCKIT_SZ_1};
     for (size_t i = 0; i < sizeof pairs / sizeof pairs[0]; i++) {
         for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
-            CHECK(inspects(pairs[i].in, R10, OBJ, szs[j], pairs[i].want));
-            CHECK(inspects(pairs[i].in, R10, ASM, szs[j], pairs[i].want));
-            CHECK(inspects(pairs[i].in, R10, OBJ | ASM, szs[j], pairs[i].want));
+            CHECK(inspects(pairs[i].in, szs[j], pairs[i].want));
         }
     }
 
@@ -4314,18 +4763,15 @@ static void test_inspect_pairs(void)
                   S("FMOV        @R15+,DR12") S("RTS") S("FSCHG"));
     static const char flipped[] = F(S("FMOV.S      FR12,@-R15") S("FSCHG")
                                         S("RTS") S("FMOV.S      @R15+,FR12"));
-    CHECK(inspects(stacked, R10, OBJ | ASM, UNKNOWN, "operand fschg-pairs 3"));
-    CHECK(inspects(stacked, R10, OBJ | ASM, SHCKIT_SZ_0,
-                   "operand fschg-pairs 3"));
-    CHECK(inspects(stacked, R10, OBJ | ASM, SHCKIT_SZ_1,
-                   "operand fschg-pairs 3"));
-    CHECK(inspects(flipped, R10, ASM, SHCKIT_SZ_0, "operand fschg-pairs 5"));
-    CHECK(inspects(flipped, R10, ASM, SHCKIT_SZ_1, "operand fschg-pairs 5"));
-    CHECK(inspects(flipped, R10, ASM, UNKNOWN,
-                   "operand fschg-pairs 5; stack-unknown 5"));
-    CHECK(inspects_all(flipped, R10, ASM, SHCKIT_SZ_0,
-                       "operand fschg-pairs 5, abi stack-above-entry 5 +4"));
-    CHECK(inspects_all(flipped, R10, ASM, UNKNOWN,
+    CHECK(inspects(stacked, UNKNOWN, "operand fschg-pairs 3"));
+    CHECK(inspects(stacked, SHCKIT_SZ_0, "operand fschg-pairs 3"));
+    CHECK(inspects(stacked, SHCKIT_SZ_1, "operand fschg-pairs 3"));
+    CHECK(inspects(flipped, SHCKIT_SZ_0, "operand fschg-pairs 5"));
+    CHECK(inspects(flipped, SHCKIT_SZ_1, "operand fschg-pairs 5"));
+    CHECK(inspects(flipped, UNKNOWN, "operand fschg-pairs 5; stack-unknown 5"));
+    CHECK(inspects_all(flipped, SHCKIT_SZ_0,
+                       "operand fschg-pairs 5, abi return-above-entry 5 +4"));
+    CHECK(inspects_all(flipped, UNKNOWN,
                        "operand fschg-pairs 5; stack-unknown 5"));
 
     // no witness: an even count, XD8 to XD14, moves between registers, a
@@ -4366,8 +4812,7 @@ static void test_inspect_pairs(void)
     };
     for (size_t i = 0; i < sizeof singles / sizeof singles[0]; i++) {
         for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
-            CHECK(inspects(singles[i].in, R10, OBJ | ASM, szs[j],
-                           singles[i].want));
+            CHECK(inspects(singles[i].in, szs[j], singles[i].want));
         }
     }
 
@@ -4631,24 +5076,16 @@ static void test_inspect_pairs(void)
     };
     for (size_t i = 0; i < sizeof compiled / sizeof compiled[0]; i++) {
         for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
-            CHECK(inspects(compiled[i], R10, OBJ | ASM, szs[j], "none"));
+            CHECK(inspects(compiled[i], szs[j], "none"));
         }
     }
-
-    // R10 alone: R32 writes no FSCHG, and a release the reading doesn't
-    // cover takes no rule that reads FSCHG
-    CHECK(inspects(pairs[0].in, R32, OBJ | ASM, UNKNOWN,
-                   "opcode fschg 2; abi-scope"));
-    CHECK(inspects(pairs[0].in, "5.0R31", OBJ | ASM, UNKNOWN,
-                   "none; rule-scope 2"));
 }
 
 static void test_inspect_compiled(void)
 {
     // what R10 and R32 write for C, cut down, which no rule may witness: a
     // variable C reads before it sets it, in R0 to R3 or FR0 to FR3, or in
-    // R4 past a call, which may have changed it, and R32's double precision
-    // moving a pop of DR14 above the pushes, which R10 never does
+    // R4 past a call, which may have changed it
     static const char *const unset[] = {
         // int f(int a, int b, int c, int d)
         // { int x; x += a; x += b; return x + c + d; }
@@ -4669,8 +5106,11 @@ static void test_inspect_compiled(void)
             S("FMOV.S      FR5,FR3") S("FMOV.S      FR4,FR2") S("RTS")
                 S("FMOV.S      FR5,FR1"),
     };
-    // under R32 -fpu=double, double f(double a, double b, double c,
-    // double d) { double x = 0.0; x /= a; ... return x; }, eight divisions
+    // the scheduler lifting a pop above the entry's pushes, which each
+    // release from R26 on does, so R15 stands above the entry on the way but
+    // not at the return. Under -fpu=double, double f(double a, double b,
+    // double c, double d) { double x = 0.0; x /= a; ... return x; }, eight
+    // divisions
     static const char pops[] =
         F(S("FMOV.S      FR14,FR0") S("FMOV.S      @R15+,FR14")
               S("FMOV.S      FR15,FR1") S("FMOV.S      FR15,@-R15")
@@ -4679,6 +5119,21 @@ static void test_inspect_compiled(void)
                           S("FDIV        DR4,DR14") S("FDIV        DR6,DR14")
                               S("RTS") S("FMOV.S      @R15+,FR15") "L1:\n" S(
                                   ".DATA.L     H'00000000"));
+    // and under 5.1 R13 -fpu=single, #pragma interrupt(h) void h(void)
+    // { float x = g; x /= a; ... g = x; }, seventeen divisions, cut down:
+    // the pop of FPSCR makes SZ unknown, so the FR pushes lose R15's offset
+    static const char lifted[] =
+        F(S("MOV.L       @R15+,R4") S("FMOV.S      @R15+,FR4")
+              S("FDIV        FR3,FR4") S("FMOV.S      @R15+,FR3") S(
+                  "MOV.L       @R15+,R5") S("LDS.L       @R15+,FPSCR")
+                  S("FMOV.S      FR4,@R5") S("FDIV        FR3,FR4") S(
+                      "MOV.L       R5,@-R15") S("MOV.L       R4,@-R15")
+                      S("MOV.L       L1,R5") S("MOV.L       L1+4,R4") S(
+                          "FMOV.S      FR4,@-R15") S("FMOV.S      FR3,@-R15")
+                          S("STS.L       FPSCR,@-R15") S("FMOV.S      @R4,FR3")
+                              S("FMOV.S      @R5,FR4") S("FDIV        FR3,FR4")
+                                  S("RTE") S("NOP") "L1:\n" S(".DATA.L     _g")
+                                      S(".DATA.L     _a"));
     // int a1(int a) { int x; g(); x += a; return x; }, the same in both
     // modes and under an SDK build's flags
     static const char past[] =
@@ -4692,16 +5147,13 @@ static void test_inspect_compiled(void)
     char in[512];
     for (size_t i = 0; i < sizeof unset / sizeof unset[0]; i++) {
         (void)snprintf(in, sizeof in, F("%s"), unset[i]);
-        CHECK(inspects(in, R10, OBJ | ASM, SHCKIT_SZ_0, "none"));
-        CHECK(inspects(in, R32, OBJ | ASM, SHCKIT_SZ_0, "none; abi-scope"));
+        CHECK(inspects(in, SHCKIT_SZ_0, "none"));
     }
-    CHECK(inspects(past, R10, OBJ, SHCKIT_SZ_0, "none; call 5"));
-    CHECK(inspects(past, R10, ASM, SHCKIT_SZ_0, "none; call 5"));
-    CHECK(inspects(past, R32, OBJ, SHCKIT_SZ_0, "none; abi-scope"));
-    CHECK(inspects(past, R32, ASM, SHCKIT_SZ_0, "none; abi-scope"));
-    CHECK(inspects(pops, R32, OBJ | ASM, SHCKIT_SZ_0, "none; abi-scope"));
-    CHECK(inspects(pops, R10, OBJ | ASM, SHCKIT_SZ_0,
-                   "abi stack-above-entry 3 +4"));
+    CHECK(inspects(past, SHCKIT_SZ_0, "none; call 5"));
+    CHECK(inspects(pops, SHCKIT_SZ_0, "none"));
+    CHECK(inspects(pops, SHCKIT_SZ_1, "none"));
+    CHECK(inspects(pops, UNKNOWN, "none"));
+    CHECK(inspects(lifted, UNKNOWN, "none; stack-unknown 14"));
 
     // what R10 and R32 write for C that reads or sets T, with no SETT: the
     // first four R10's under an SDK build's flags, the last R32's for the
@@ -4727,10 +5179,8 @@ static void test_inspect_compiled(void)
                 S("RTS") S("SHAR        R0"),
     };
     for (size_t i = 0; i < sizeof carries / sizeof carries[0]; i++) {
-        bool r32 = i + 1 == sizeof carries / sizeof carries[0];
         (void)snprintf(in, sizeof in, F("%s"), carries[i]);
-        CHECK(inspects(in, r32 ? R32 : R10, OBJ | ASM, UNKNOWN,
-                       r32 ? "none; abi-scope" : "none"));
+        CHECK(inspects(in, UNKNOWN, "none"));
     }
 
     // what R10 and R32 write for C past a call, the same in both modes and
@@ -4760,13 +5210,9 @@ static void test_inspect_compiled(void)
                 S("LDS.L       @R15+,PR") S("MOVT        R0") S("RTS")
                     S("XOR         #1,R0") "L1:\n" S(".DATA.L     _g"),
     };
-    static const unsigned modes[] = {OBJ, ASM};
     for (size_t i = 0; i < sizeof calls / sizeof calls[0]; i++) {
         (void)snprintf(in, sizeof in, F("%s"), calls[i]);
-        for (size_t j = 0; j < sizeof modes / sizeof modes[0]; j++) {
-            CHECK(inspects(in, R10, modes[j], UNKNOWN, "none; call 4"));
-            CHECK(inspects(in, R32, modes[j], UNKNOWN, "none; abi-scope"));
-        }
+        CHECK(inspects(in, UNKNOWN, "none; call 4"));
     }
 
     // int f(int a) { return g(a); }, g a #pragma inline_asm function of SETT
@@ -4776,7 +5222,7 @@ static void test_inspect_compiled(void)
     static const char copied[] = S(".SECTION    PSG,CODE,ALIGN=4")
         F("                      SETT\n"
           " ADDC R4,R0 \n" ALIGN S("RTS") S("NOP") S(".END"));
-    CHECK(inspects_lines(copied, 1, 7, R10, ASM, UNKNOWN,
+    CHECK(inspects_lines(copied, 1, 7, UNKNOWN,
                          "opcode sett 3; assembler-layout 5"));
 
     // R10's returns: a 16-byte frame freed with the last call's 8 bytes of
@@ -4844,8 +5290,7 @@ static void test_inspect_compiled(void)
     static const int szs[] = {UNKNOWN, SHCKIT_SZ_0, SHCKIT_SZ_1};
     for (size_t i = 0; i < sizeof returns / sizeof returns[0]; i++) {
         for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
-            CHECK(inspects(returns[i].in, R10, OBJ | ASM, szs[j],
-                           returns[i].want));
+            CHECK(inspects(returns[i].in, szs[j], returns[i].want));
         }
     }
 }
@@ -4853,72 +5298,52 @@ static void test_inspect_compiled(void)
 static void test_inspect_all(void)
 {
     // every witness, in line order and at one line in the rules table's
-    // order: an instruction rule's at each instruction, the stack rule's
-    // after each step that leaves R15 above its entry value, and its
-    // fschg-pairs before stack-above-entry at one line, as the table lists
-    // them
+    // order: an instruction rule's at each instruction, the stack rule's at
+    // each return's slot, and its fschg-pairs before return-above-entry at
+    // one line, as the table lists them
     CHECK(inspects_all(
-        F(S("SETT") S("MOV.L       @R15+,R1") S("MOV.L       @(0,R4),R0")
-              S("MOV.L       @R15+,R2") S("RTS") S("ADD         #-8,R15")),
-        R10, ASM, UNKNOWN,
-        "opcode sett 2, abi stack-above-entry 3 +4, operand "
-        "zero-displacement 4, abi stack-above-entry 4 +4, abi "
-        "stack-above-entry 5 +8"));
-    CHECK(inspects_all(
-        F(S("FSCHG") S("FMOV        @R15+,DR12") S("RTS") S("FSCHG")), R10, ASM,
-        SHCKIT_SZ_0,
-        "operand fschg-pairs 3, abi stack-above-entry 3 +8, abi "
-        "stack-above-entry 5 +8"));
+        F(S("SETT") S("MOV.L       @(0,R4),R0") S("BT          L1") S("RTS")
+              S("ADD         #8,R15") "L1:\n" S("RTS") S("ADD         #4,R15")),
+        UNKNOWN,
+        "opcode sett 2, operand zero-displacement 3, abi "
+        "return-above-entry 6 +8, abi return-above-entry 9 +4"));
+    CHECK(inspects_all(F(S("FSCHG") S("RTS") S("FMOV        @R15+,DR12")),
+                       SHCKIT_SZ_0,
+                       "operand fschg-pairs 4, abi return-above-entry 4 +8"));
 
     // an instruction rule's witness before the stack rule's at one line and
     // kind, and a return's slot below the entry
-    CHECK(inspects_all(F(S("LDS.L       @R15+,FPSCR") S("RTS") S("NOP")), R10,
-                       ASM, UNKNOWN,
-                       "abi fpscr-save 2, abi stack-above-entry 2 +4, abi "
-                       "stack-above-entry 4 +4"));
-    CHECK(inspects_all(F(S("ADD         #-4,R15") S("RTS") S("NOP")), R10, ASM,
-                       UNKNOWN, "abi return-below-entry 4 -4"));
+    CHECK(inspects_all(F(S("RTS") S("LDS.L       @R15+,FPSCR")), UNKNOWN,
+                       "abi fpscr-save 3, abi return-above-entry 3 +4"));
+    CHECK(inspects_all(F(S("ADD         #-4,R15") S("RTS") S("NOP")), UNKNOWN,
+                       "abi return-below-entry 4 -4"));
 
-    // with SZ unknown, each witness both SZ find at one line, naming the
-    // offset nearer the entry, and stack-unknown at line 5, whose witness is
-    // SZ 1's alone
+    // with SZ unknown, stack-unknown at line 5, whose witness is SZ 1's alone
     static const char popped[] = F(S("FMOV.S      @R15+,FR4") S(
         "ADD         #-8,R15") S("RTS") S("ADD         #4,R15"));
-    CHECK(inspects_all(popped, R10, ASM, SHCKIT_SZ_0,
-                       "abi stack-above-entry 2 +4"));
-    CHECK(inspects_all(popped, R10, ASM, SHCKIT_SZ_1,
-                       "abi stack-above-entry 2 +8, abi stack-above-entry 5 "
-                       "+4"));
-    CHECK(inspects_all(popped, R10, ASM, UNKNOWN,
-                       "abi stack-above-entry 2 +4; stack-unknown 5"));
+    CHECK(inspects_all(popped, SHCKIT_SZ_0, "none"));
+    CHECK(inspects_all(popped, SHCKIT_SZ_1, "abi return-above-entry 5 +4"));
+    CHECK(inspects_all(popped, UNKNOWN, "none; stack-unknown 5"));
 
-    // no branch or return, even one reached above the entry, as the BT on
-    // line 5 is from line 14
+    // each return reached above the entry, by the path through line 12
     CHECK(inspects_all(
-        F(S("BRA         L3") S("NOP") "L1:\n" S("BT          L2") S("RTS")
-              S("ADD         #-4,R15") "L2:\n" S("RTS")
-                  S("ADD         #-4,R15") "L3:\n" S("MOV.L       @R15+,R1")
-                      S("BRA         L1") S("NOP")),
-        R10, ASM, UNKNOWN,
-        "abi stack-above-entry 12 +4, abi stack-above-entry 14 +4"));
-    CHECK(inspects_all(F(S("MOV.L       #1,R15") S("RTS") S("NOP")), R10, ASM,
-                       UNKNOWN,
-                       "operand small-constant 2 #1, abi stack-written 2; "
+        F(S("BRA         L3") S("NOP") "L1:\n" S("BT          L2") S("RTS") S(
+            "NOP") "L2:\n" S("RTS") S("NOP") "L3:\n" S("MOV.L       @R15+,R1")
+              S("BRA         L1") S("NOP")),
+        UNKNOWN, "abi return-above-entry 7 +4, abi return-above-entry 10 +4"));
+    CHECK(inspects_all(F(S("MOV.L       #-1,R15") S("RTS") S("NOP")), UNKNOWN,
+                       "operand small-constant 2 #-1, abi stack-written 2; "
                        "stack-unknown 2"));
 
-    // witnesses on both sides of a limit, none and a limit, and a release no
-    // rule holds for
+    // witnesses on both sides of a limit, and none and a limit
     CHECK(inspects_all(
         F(S("SETT") S("BSR         _g") S("NOP") S("SETT") S("RTS") S("NOP")),
-        R10, ASM, UNKNOWN, "opcode sett 2, opcode sett 5; call 3"));
-    CHECK(inspects_all(F(S("BSR         _g") S("NOP") S("RTS") S("NOP")), R10,
-                       ASM, UNKNOWN, "none; call 2"));
-    CHECK(inspects_all(F(S("SETT") S("RTS") S("NOP")), "6.0AD", ASM, UNKNOWN,
-                       "none; producer-scope"));
+        UNKNOWN, "opcode sett 2, opcode sett 5; call 3"));
+    CHECK(inspects_all(F(S("BSR         _g") S("NOP") S("RTS") S("NOP")),
+                       UNKNOWN, "none; call 2"));
 }
 
 static bool inspect_refuses(const struct shckit_text *text,
-                            const struct shckit_producer *producer,
                             const struct shckit_function *function, int error)
 {
     static const struct shckit_inspection none = {
@@ -4930,17 +5355,16 @@ static bool inspect_refuses(const struct shckit_text *text,
     size_t count = 1;
     memset(&result, 0xff, sizeof result);
     memset(&all, 0xff, sizeof all);
-    return shckit_inspect(text, producer, function, &result) == error &&
+    return shckit_inspect(text, function, &result) == error &&
            same_inspection(&result, &none) &&
-           shckit_inspect_all(text, producer, function, &all, &found, &count) ==
-               error &&
+           shckit_inspect_all(text, function, &all, &found, &count) == error &&
            same_inspection(&all, &none) && found == NULL && count == 0;
 }
 
 static void test_inspect_contracts(void)
 {
     // a function inside a text, one whose last line is a branch with its
-    // slot past it, then ranges, sz and modes inspect can't take, the .END
+    // slot past it, then ranges and sz inspect can't take, the .END
     // line among them, each leaving no witness or limit
     static const struct shckit_function bad[] = {
         {3, 3, SHCKIT_SZ_UNKNOWN},
@@ -4953,40 +5377,29 @@ static void test_inspect_contracts(void)
     };
     struct shckit_text *text =
         read_text(F(S("RTS") S("ADD         #8,R15")) "_end:\n" S(".END"));
-    struct shckit_producer producer = {R10, ASM};
     struct shckit_function function = {0, 3, SHCKIT_SZ_UNKNOWN};
     struct shckit_inspection result;
     if (CHECK(text != NULL)) {
-        CHECK(shckit_inspect(text, &producer, &function, &result) ==
-                  SHCKIT_OK &&
+        CHECK(shckit_inspect(text, &function, &result) == SHCKIT_OK &&
               result.witness.kind == SHCKIT_ABI && result.witness.index == 2 &&
               result.witness.value == 8 && result.incomplete == NULL);
         function.end = 2;
-        CHECK(shckit_inspect(text, &producer, &function, &result) ==
-                  SHCKIT_OK &&
+        CHECK(shckit_inspect(text, &function, &result) == SHCKIT_OK &&
               result.witness.kind == SHCKIT_NO_WITNESS &&
               result.incomplete != NULL &&
               strcmp(result.incomplete, "delay-slot") == 0 &&
               result.incomplete_index == 1);
         function.end = 3;
         for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
-            CHECK(inspect_refuses(text, &producer, &bad[i],
-                                  SHCKIT_INSPECT_INPUT));
+            CHECK(inspect_refuses(text, &bad[i], SHCKIT_INSPECT_INPUT));
         }
-        producer.modes = 0;
-        CHECK(
-            inspect_refuses(text, &producer, &function, SHCKIT_INSPECT_INPUT));
-        producer.modes = 4;
-        CHECK(
-            inspect_refuses(text, &producer, &function, SHCKIT_INSPECT_INPUT));
     }
     shckit_free(text);
 
     // a text check refuses
     text = read_text(F(S("FLURB       R0") S("RTS") S("NOP")));
-    producer.modes = ASM;
     if (CHECK(text != NULL)) {
-        CHECK(inspect_refuses(text, &producer, &function, SHCKIT_CHECK_FAILED));
+        CHECK(inspect_refuses(text, &function, SHCKIT_CHECK_FAILED));
     }
     shckit_free(text);
 }
@@ -6413,7 +6826,7 @@ static const char returns[] =
 static const char calls[] = "_entry:\n" S("BSR         _g") S("NOP") S("RTS")
     S("ADD         #8,R15") "_end:\n" S(".END");
 static const char loads[] =
-    "_entry:\n" S("MOV.L       #0,R4") S("RTS") S("NOP") S(".END");
+    "_entry:\n" S("MOV.L       #-1,R4") S("RTS") S("NOP") S(".END");
 static const char blocks[] =
     "_entry:\n" S("NOP") DATA "_x:\n" S(".DATA.L     0") S(".END");
 static const char last[] = "_entry:\n" S("RTS") S("ADD         #8,R15");
@@ -6498,7 +6911,7 @@ static void write_samples(const char *base)
     write_sample(base, "mova", mova);
     write_sample(base, "returns", returns);
     (void)snprintf(inspection, sizeof inspection,
-                   "%s.returns:3: _entry: abi: stack-above-entry (SP +8)\n",
+                   "%s.returns:3: _entry: abi: return-above-entry (SP +8)\n",
                    base);
     write_sample(base, "returned", inspection);
     write_sample(base, "calls", calls);
@@ -6509,13 +6922,8 @@ static void write_samples(const char *base)
     write_sample(base, "called", inspection);
     write_sample(base, "loads", loads);
     (void)snprintf(inspection, sizeof inspection,
-                   "%s.loads:2: _entry: operand: small-constant (#0)\n", base);
+                   "%s.loads:2: _entry: operand: small-constant (#-1)\n", base);
     write_sample(base, "constant", inspection);
-    (void)snprintf(inspection, sizeof inspection,
-                   "%s.loads:1: _entry: none\n"
-                   "%s.loads:2: _entry: incomplete: rule-scope\n",
-                   base, base);
-    write_sample(base, "scoped", inspection);
     write_sample(base, "blocks", blocks);
     (void)snprintf(inspection, sizeof inspection,
                    "%s.blocks:1: _entry: none\n"
@@ -6524,7 +6932,8 @@ static void write_samples(const char *base)
     write_sample(base, "fell", inspection);
     write_sample(base, "last", last);
     (void)snprintf(inspection, sizeof inspection,
-                   "%s.last:3: _entry: abi: stack-above-entry (SP +8)\n", base);
+                   "%s.last:3: _entry: abi: return-above-entry (SP +8)\n",
+                   base);
     write_sample(base, "lasted", inspection);
     write_sample(base, "witnesses", witnesses);
     (void)snprintf(inspection, sizeof inspection,
@@ -6565,6 +6974,7 @@ int main(int argc, char **argv)
     test_patch_names();
     test_inspect_rules();
     test_inspect_operands();
+    test_inspect_integers();
     test_inspect_labels();
     test_inspect_stack_written();
     test_inspect_fpscr();
