@@ -4638,8 +4638,9 @@ int shckit_translate(const struct shckit_text *text, void *dst, size_t cap,
 // Inspection. An instruction rule reads each instruction of the function in
 // a code section, reached or not. The stack rule follows control from the
 // entry, through branches to the function's own labels, until it meets what
-// it can't follow: a limit. It judges fschg-pairs too, on the lines it
-// reaches. docs/inspect.md has the rules and their evidence.
+// it can't follow: a limit. It judges what follows an odd number of FSCHGs
+// too, on the lines it reaches. docs/inspect.md has the rules and their
+// evidence.
 
 // The instruction rules. A rule with operands is a template's: SHC is known
 // to write the instruction with those alone.
@@ -4660,6 +4661,7 @@ static const struct {
     {"cache-line", "OCBP", "-", NULL, NULL},
     {"cache-line", "OCBWB", "-", NULL, NULL},
     {"sett", "SETT", "-", NULL, NULL},
+    {"cmp-str", "CMP/STR", "-L", NULL, NULL},
     {"fipr-registers", "FIPR", "-S", "FV4", "FV0"},
     {"ftrv-registers", "FTRV", "-S", "XMTRX", "FV0"},
     {"fsca-registers", "FSCA", "-S", "FPUL", "DR0"},
@@ -4676,6 +4678,9 @@ struct witnesses {
     bool failed; // allocation failed, so the witnesses are incomplete
 };
 
+// The registers FIPR FV4,FV0 reads: FV0 is FR0 to FR3, and FV4 FR4 to FR7.
+#define VECTOR_REGISTERS 8
+
 // What the rules share: the text, the function's lines from first up to
 // end, the labels asmsh defines sorted by by_name, what the rules found, and
 // unless list is NULL each witness they find. blocks[i] is the line that opens
@@ -4683,8 +4688,11 @@ struct witnesses {
 // text names a label of line i's run of data, up to its last data line, other
 // than as the source of a PC-relative load. returns is whether the function
 // holds an RTS in a code section, reached or not, and switched is the line of
-// its stack switch's MOV R0,R15, or SIZE_MAX. flow is what integer-constant
-// follows its loads through.
+// its stack switch's MOV R0,R15, or SIZE_MAX. loads[n] is how many loads of
+// FRn the function holds in a code section, reached or not, and fed[n] the
+// line of the last FIPR FV4,FV0 they feed, a load to each FIPR in line
+// order, or SIZE_MAX where the function holds no load of FRn, or more than
+// FIPRs. flow is what integer-constant follows its loads through.
 struct inspector {
     const struct shckit_text *text;
     size_t first;
@@ -4695,6 +4703,8 @@ struct inspector {
     const bool *exposed;
     bool returns;
     size_t switched;
+    size_t loads[VECTOR_REGISTERS];
+    size_t fed[VECTOR_REGISTERS];
     struct shckit_inspection *found;
     struct witnesses *list;
     struct flow *flow;
@@ -5210,6 +5220,28 @@ static size_t next_instruction(const struct inspector *in, size_t at)
     return SIZE_MAX;
 }
 
+static bool fschg_slot(const struct inspector *in, size_t index, int32_t *value,
+                       const char **doubt)
+{
+    // an FSCHG in the slot of a delayed branch of the function: the first
+    // line above it that control doesn't pass is RTS, RTE, BRA, BRAF, JMP,
+    // BSR, BSRF, JSR, BT/S or BF/S. R10, the one release known to write
+    // FSCHG, fills a slot only with an instruction a stage marked for one,
+    // and no stage marks an FSCHG.
+    const struct shckit_text *text = in->text;
+    size_t at = index;
+    (void)doubt;
+    *value = 0;
+    if (!one_of(&text->lines[index], "FSCHG")) {
+        return false;
+    }
+    while (at > in->first && inert(text, at - 1)) {
+        at--;
+    }
+    return at > in->first && text->lines[at - 1].kind == SHCKIT_INSTRUCTION &&
+           (shckit_flow(text, at - 1) & SHCKIT_DELAYED) != 0;
+}
+
 static bool moves(const struct inspector *in, size_t index, int from_kind,
                   int from, int to_kind, int to)
 {
@@ -5382,11 +5414,72 @@ static bool fpscr_save(const struct inspector *in, size_t index, int32_t *value,
            ops.kinds[1] == KIND_FPSCR;
 }
 
+static bool below_branch(const struct inspector *in, size_t index)
+{
+    // whether the instruction at index stands in the run of a BT, BF, BT/S
+    // or BF/S of the function, below the branch and its slot. A run holds
+    // instructions other than BRA, BRAF, JMP, RTS, RTE and TRAPA and lines
+    // control passes, and a label ends it, the instruction's own too: SHC
+    // starts each function at a label, and can write a static one right
+    // below a branch of the function above it, so only a run is known to be
+    // one function's.
+    const struct shckit_line *lines = in->text->lines;
+    size_t at = index;
+    size_t between = 0;
+    while (at > in->first && lines[at].label.len == 0) {
+        const struct shckit_line *above = &lines[--at];
+        if (above->kind == SHCKIT_CONTINUATION) {
+            // the statement it continues, above it, decides
+            continue;
+        }
+        if (above->kind != SHCKIT_INSTRUCTION) {
+            if (!inert(in->text, at)) {
+                return false;
+            }
+            continue;
+        }
+        // the first instruction below a BT/S or BF/S is its slot
+        if (one_of(above, "BT BF") ||
+            (between != 0 && one_of(above, "BT/S BF/S"))) {
+            return true;
+        }
+        if (one_of(above, "BRA BRAF JMP RTS RTE TRAPA")) {
+            return false;
+        }
+        between++;
+    }
+    return false;
+}
+
+static bool pr_save_below_branch(const struct inspector *in, size_t index,
+                                 int32_t *value, const char **doubt)
+{
+    // PR's push, STS.L PR,@-R15, below a conditional branch and its slot, in
+    // the branch's run. SHC is known to push PR only in a function's entry,
+    // above the function's first branch.
+    const struct shckit_line *line = &in->text->lines[index];
+    struct operands ops;
+    (void)doubt;
+    *value = 0;
+    if (!one_of(line, "STS")) {
+        return false;
+    }
+    read_operands(line, &ops);
+    return ops.count == 2 && ops.kinds[0] == KIND_PR &&
+           ops.kinds[1] == KIND_PRE && ops.regs[1] == 15 &&
+           below_branch(in, index);
+}
+
 // The stack rule (docs/inspect.md). It follows control from the entry and
 // joins each path's frame into the lines it reaches until none changes.
 // Then, where the runs under SZ 0 and SZ 1 agree, or in the one run --sz
-// gives, it finds three witnesses:
+// gives, it finds:
 // - fschg-pairs: a pair's move after an odd number of FSCHGs on every path;
+// - fschg-dt: a DT after an odd number of them;
+// - fschg-stores: a store of FR4, FR6, DR4 or DR6 after an odd number of
+//   them;
+// - fschg-register-moves: an FMOV between FPU registers after an odd number
+//   of them;
 // - return-above-entry: R15 above its entry value after an RTS's or an RTE's
 //   slot;
 // - return-below-entry: R15 below its entry value after an RTS's slot.
@@ -5794,6 +5887,13 @@ static size_t edges(const struct inspect_node *node, size_t to[2])
     return count;
 }
 
+static bool in_memory(int kind)
+{
+    // an operand an FMOV moves through memory: @Rn, @Rn+, @-Rn or @(R0,Rn)
+    return kind == KIND_AT || kind == KIND_POST || kind == KIND_PRE ||
+           kind == KIND_INDEX;
+}
+
 static bool moves_pair(const struct shckit_line *line)
 {
     // an FMOV between memory and FR8, FR10, FR12, FR14 or DR8 to DR14, whose
@@ -5805,20 +5905,79 @@ static bool moves_pair(const struct shckit_line *line)
     }
     read_operands(line, &ops);
     for (size_t i = 0; ops.count == 2 && i < 2; i++) {
-        int other = ops.kinds[1 - i];
         if (listed("FR8 FR10 FR12 FR14 DR8 DR10 DR12 DR14",
                    line->bytes + ops.spans[i].at, ops.spans[i].len) &&
-            (other == KIND_AT || other == KIND_POST || other == KIND_PRE ||
-             other == KIND_INDEX)) {
+            in_memory(ops.kinds[1 - i])) {
             return true;
         }
     }
     return false;
 }
 
+static bool counts_down(const struct shckit_line *line)
+{
+    // a DT. R10 writes one only in place of a compare, and C's compares
+    // stand outside its templates' runs of FSCHG.
+    return one_of(line, "DT");
+}
+
+static bool stores_loaded_pair(const struct shckit_line *line)
+{
+    // an FMOV to memory from FR4, FR6, DR4 or DR6, whose code word's
+    // register field is 4 or 6 however it is spelled: under SZ 1, a store of
+    // DR4 or DR6, the pairs R10's templates load and never store
+    struct operands ops;
+    if (!one_of(line, "FMOV")) {
+        return false;
+    }
+    read_operands(line, &ops);
+    return ops.count == 2 &&
+           listed("FR4 FR6 DR4 DR6", line->bytes + ops.spans[0].at,
+                  ops.spans[0].len) &&
+           in_memory(ops.kinds[1]);
+}
+
+static bool moves_registers(const struct shckit_line *line)
+{
+    // an FMOV between two FPU registers, FRn, DRn or XDn: check made sure
+    // an FMOV's operand outside memory is one. In a run R10 moves a pair
+    // only between a register and memory.
+    struct operands ops;
+    if (!one_of(line, "FMOV")) {
+        return false;
+    }
+    read_operands(line, &ops);
+    return ops.count == 2 && !in_memory(ops.kinds[0]) &&
+           !in_memory(ops.kinds[1]);
+}
+
+// The rules that read a line once an odd number of FSCHGs has run on every
+// path the stack rule follows to it, in the rules table's order.
+static const struct {
+    const char *rule;
+    bool (*shows)(const struct shckit_line *line);
+} fschg_rules[] = {
+    {"fschg-pairs", moves_pair},
+    {"fschg-dt", counts_down},
+    {"fschg-stores", stores_loaded_pair},
+    {"fschg-register-moves", moves_registers},
+};
+
+static const char *after_fschg(const struct shckit_line *line)
+{
+    // the rule of fschg_rules whose witness the line is, or NULL. No line is
+    // two rules'.
+    for (size_t i = 0; i < sizeof fschg_rules / sizeof fschg_rules[0]; i++) {
+        if (fschg_rules[i].shows(line)) {
+            return fschg_rules[i].rule;
+        }
+    }
+    return NULL;
+}
+
 // What the stack rule finds at a line of its graph and the line's slot, in
-// the rules table's order: at each of the two steps a pair's move, and past
-// a return's slot R15 above the entry or below it.
+// the rules table's order: at each of the two steps one of fschg_rules'
+// witnesses, and past a return's slot R15 above the entry or below it.
 #define MOST_FOUND 3
 
 struct verdict {
@@ -5869,8 +6028,11 @@ static const char *pass_through(const struct walk *walk, size_t at,
         if (known && !frame->sp.known) {
             limit(in->found, "stack-unknown", line);
         }
-        if (frame->fschgs == 1 && moves_pair(&in->text->lines[line])) {
-            note(verdict, SHCKIT_OPERAND, "fschg-pairs", line, 0);
+        if (frame->fschgs == 1) {
+            const char *rule = after_fschg(&in->text->lines[line]);
+            if (rule != NULL) {
+                note(verdict, SHCKIT_OPERAND, rule, line, 0);
+            }
         }
     }
     if (verdict != NULL && node->leaves == TO_RETURN && frame->sp.known) {
@@ -5934,8 +6096,8 @@ static void agree(const struct inspector *in, const struct verdict *one,
     // entry's value, which R15 is at least as far from under either SZ; a
     // rule's offsets at a line share a sign. A witness either finds alone
     // is stack-unknown. The count of FSCHGs starts at 0 under either SZ, so
-    // both find the same pairs' moves. With one run, one and two are its
-    // verdict.
+    // both find fschg_rules' witnesses alike. With one run, one and two are
+    // its verdict.
     for (size_t i = 0; i < one->count; i++) {
         struct shckit_witness kept = one->at[i];
         const struct shckit_witness *other = partner(two, &kept);
@@ -6465,6 +6627,147 @@ static bool integer_constant(const struct inspector *in, size_t index,
     return true;
 }
 
+// fipr-unloaded and fipr-shared (docs/inspect.md). FIPR FV4,FV0, the one
+// FIPR SHC is known to write, reads FR0 to FR7. SHC writes it from one
+// template, which loads each of the eight from memory, and no pass of SHCPEP
+// is known to take such a load away, or to copy a FIPR without its loads. So
+// a function holds at least as many loads of each register as FIPRs: a FIPR
+// is fipr-unloaded's witness in one that holds no load of a register, and
+// fipr-shared's past the loads of one that holds fewer loads than FIPRs. The
+// rules count each load of the function, reached or not, and follow no path:
+// SHC's scheduler can put a FIPR above its own loads.
+
+static bool reads_vectors(const struct shckit_line *line)
+{
+    // FIPR FV4,FV0. check made sure a FIPR on one line has two operands.
+    struct operands ops;
+    if (!is_instruction(line, "FIPR", "-S")) {
+        return false;
+    }
+    read_operands(line, &ops);
+    return ops.count == 2 && spelled(line, ops.spans[0], "FV4") &&
+           spelled(line, ops.spans[1], "FV0");
+}
+
+static unsigned vector_load(const struct shckit_text *text, size_t index,
+                            bool paired)
+{
+    // the registers of FR0 to FR7 that the line at index loads, a bit for
+    // each: an FMOV in a code section from memory, @Rm, @Rm+ or @(R0,Rm),
+    // into FRn, or into DRn, which is FRn and FRn+1, or into XDn, which is
+    // FRn+1: FMOV @Rm,XD2 and FMOV.S @Rm,FR3 are one word, which with SZ 0
+    // moves FR3. Where paired, a load into FR0, FR2, FR4 or FR6 counts for
+    // the register above it too: FMOV.S @Rm,FR2 and FMOV @Rm,DR2 are one
+    // word, which with SZ 1 moves the pair. An FMOV with a continuation
+    // below it, whose operands inspect reads on one line alone, counts for
+    // all eight.
+    static const char *const singles[VECTOR_REGISTERS] = {
+        "FR0", "FR1", "FR2", "FR3", "FR4", "FR5", "FR6", "FR7"};
+    static const char *const pairs[VECTOR_REGISTERS / 2] = {"DR0", "DR2", "DR4",
+                                                            "DR6"};
+    static const char *const extended[VECTOR_REGISTERS / 2] = {"XD0", "XD2",
+                                                               "XD4", "XD6"};
+    const struct shckit_line *line = &text->lines[index];
+    struct operands ops;
+    if (!line->code || !one_of(line, "FMOV")) {
+        return 0;
+    }
+    if (continued(text, index)) {
+        return (1U << VECTOR_REGISTERS) - 1;
+    }
+    read_operands(line, &ops);
+    if (ops.count != 2 || !in_memory(ops.kinds[0])) {
+        return 0;
+    }
+    for (unsigned reg = 0; reg < VECTOR_REGISTERS; reg++) {
+        bool even = reg % 2 == 0;
+        if (spelled(line, ops.spans[1], singles[reg])) {
+            return (even && paired ? 3U : 1U) << reg;
+        }
+        if (even && spelled(line, ops.spans[1], pairs[reg / 2])) {
+            return 3U << reg;
+        }
+        if (even && spelled(line, ops.spans[1], extended[reg / 2])) {
+            return 2U << reg;
+        }
+    }
+    return 0;
+}
+
+static void count_loads(struct inspector *in, int sz)
+{
+    // in->loads and in->fed, from each line of the function. SZ may be 1 at
+    // a load, and each load is counted as paired, where the caller gives
+    // SHCKIT_SZ_1 at the entry or the function holds an FSCHG or a write of
+    // FPSCR, by LDS. A FIPR with a continuation below it, whose operands
+    // inspect reads on one line alone, isn't counted.
+    const struct shckit_text *text = in->text;
+    size_t fiprs = 0;
+    bool paired = sz == SHCKIT_SZ_1;
+    for (size_t i = in->first; i < in->end && !paired; i++) {
+        paired = text->lines[i].code && (one_of(&text->lines[i], "FSCHG") ||
+                                         sets(text, i, "LDS", KIND_FPSCR));
+    }
+    for (size_t i = in->first; i < in->end; i++) {
+        unsigned loaded = vector_load(text, i, paired);
+        for (unsigned reg = 0; reg < VECTOR_REGISTERS; reg++) {
+            in->loads[reg] += (loaded >> reg) & 1U;
+        }
+    }
+    for (unsigned reg = 0; reg < VECTOR_REGISTERS; reg++) {
+        in->fed[reg] = SIZE_MAX;
+    }
+    for (size_t i = in->first; i < in->end; i++) {
+        if (!text->lines[i].code || continued(text, i) ||
+            !reads_vectors(&text->lines[i])) {
+            continue;
+        }
+        fiprs++;
+        for (unsigned reg = 0; reg < VECTOR_REGISTERS; reg++) {
+            if (in->loads[reg] == fiprs) {
+                in->fed[reg] = i;
+            }
+        }
+    }
+}
+
+static bool fipr_unloaded(const struct inspector *in, size_t index,
+                          int32_t *value, const char **doubt)
+{
+    // FIPR FV4,FV0 in a function that holds no load of one of FR0 to FR7,
+    // naming each such register by its bit
+    unsigned unloaded = 0;
+    (void)doubt;
+    *value = 0;
+    if (!reads_vectors(&in->text->lines[index])) {
+        return false;
+    }
+    for (unsigned reg = 0; reg < VECTOR_REGISTERS; reg++) {
+        unloaded |= in->loads[reg] == 0 ? 1U << reg : 0;
+    }
+    *value = (int32_t)unloaded;
+    return unloaded != 0;
+}
+
+static bool fipr_shared(const struct inspector *in, size_t index,
+                        int32_t *value, const char **doubt)
+{
+    // FIPR FV4,FV0 below the last one that the function's loads of one of
+    // FR0 to FR7 feed, naming each such register by its bit. A register the
+    // function holds no load of is fipr-unloaded's.
+    unsigned shared = 0;
+    (void)doubt;
+    *value = 0;
+    if (!reads_vectors(&in->text->lines[index])) {
+        return false;
+    }
+    for (unsigned reg = 0; reg < VECTOR_REGISTERS; reg++) {
+        shared |= index > in->fed[reg] ? 1U << reg : 0;
+    }
+    *value = (int32_t)shared;
+    return shared != 0;
+}
+
 // The rules that read an instruction's operands whole, with the kind of
 // witness each finds. Each sets the value it names, or 0; one that can't read
 // the line sets *doubt to the limit that is and returns false.
@@ -6474,11 +6777,15 @@ static const struct {
     bool (*shows)(const struct inspector *in, size_t index, int32_t *value,
                   const char **doubt);
 } operand_rules[] = {
+    {"fipr-unloaded", SHCKIT_OPERAND, fipr_unloaded},
+    {"fipr-shared", SHCKIT_OPERAND, fipr_shared},
     {"small-constant", SHCKIT_OPERAND, small_constant},
     {"integer-constant", SHCKIT_OPERAND, integer_constant},
     {"zero-displacement", SHCKIT_OPERAND, zero_displacement},
+    {"fschg-slot", SHCKIT_OPERAND, fschg_slot},
     {"stack-written", SHCKIT_ABI, stack_written},
     {"fpscr-save", SHCKIT_ABI, fpscr_save},
+    {"pr-save-below-branch", SHCKIT_ABI, pr_save_below_branch},
 };
 
 static void read_instruction(const struct inspector *in, size_t index)
@@ -6533,8 +6840,8 @@ static int inspect(const struct shckit_text *text,
 {
     // shckit_inspect, adding each witness to list unless it is NULL
     struct inspector in = {
-        text, function->first, function->end, NULL,   0,    NULL,
-        NULL, false,           SIZE_MAX,      result, list, NULL};
+        text,  function->first, function->end, NULL, 0,      NULL, NULL,
+        false, SIZE_MAX,        {0},           {0},  result, list, NULL};
     struct flow flow = {{&in, NULL, function->end - function->first, NULL, 0},
                         NULL,
                         NULL,
@@ -6592,6 +6899,7 @@ static int inspect(const struct shckit_text *text,
             text->lines[i].code && is_instruction(&text->lines[i], "RTS", "-");
     }
     in.switched = stack_switch(&in);
+    count_loads(&in, function->sz);
     in.flow = &flow;
     for (size_t i = in.first; error == SHCKIT_OK && !flow.failed && i < in.end;
          i++) {

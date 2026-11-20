@@ -313,18 +313,26 @@ int shckit_translate(const struct shckit_text *text, void *dst, size_t cap,
 // from it stands, but a function without a witness may still not be compiled
 // from C, or may hold one a limit hides. docs/inspect.md lists the rules, and
 // what was read and swept for each, with its gaps.
+//
+// SHC's inter-module optimizer can produce witnesses from C alone. To use a
+// witness from a linked image as evidence of origin, the caller must establish
+// that the optimizer did not rewrite the module.
 
 // FPSCR.SZ at the entry, which sets the width of an FMOV through memory.
 // With SHCKIT_SZ_UNKNOWN, the stack rule finds a witness only where it finds
 // one of the same rule at the same line under SZ 0 and under SZ 1. It meets
 // each limit either meets, and stack-unknown at a line where it finds a
-// witness under one alone.
+// witness under one alone. fipr-unloaded and fipr-shared count a load of FR0,
+// FR2, FR4 or FR6 as its pair's with SHCKIT_SZ_1, or in a function that
+// holds an FSCHG or a write of FPSCR, and as written otherwise.
 enum { SHCKIT_SZ_UNKNOWN, SHCKIT_SZ_0, SHCKIT_SZ_1 };
 
 // A function: the lines from first, its entry, up to end, which isn't one of
 // them. first is a label or an instruction in a code section. Only the
 // caller can tell that the lines are one whole function that every call
-// enters at first; a label below it starts no other.
+// enters at first; a label below it starts no other. fipr-unloaded and
+// fipr-shared count over the lines, so a part of a function can show their
+// witness.
 struct shckit_function {
     size_t first;
     size_t end;
@@ -335,14 +343,16 @@ struct shckit_function {
 enum {
     SHCKIT_NO_WITNESS,
     SHCKIT_OPCODE,  // the instruction itself
-    SHCKIT_OPERAND, // the instruction's operands
+    SHCKIT_OPERAND, // the instruction's operands, or where it stands
     SHCKIT_ABI,     // a use of R15
 };
 
 // A witness, at the line it stands at. value is R15's offset in bytes from
 // its entry value once that line has run, for return-above-entry and
 // return-below-entry, with SZ unknown the nearer 0 of SZ 0's and SZ 1's; the
-// constant, for small-constant and integer-constant; and 0 for any other.
+// constant, for small-constant and integer-constant; the registers of FR0 to
+// FR7 the witness names, bit n for FRn, for fipr-unloaded and fipr-shared;
+// and 0 for any other.
 struct shckit_witness {
     int kind;         // SHCKIT_NO_WITNESS for none
     const char *rule; // static, as docs/inspect.md names it, or NULL for none

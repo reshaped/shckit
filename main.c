@@ -392,6 +392,19 @@ static size_t block_end(const struct shckit_text *text, size_t first)
     return end;
 }
 
+static void print_registers(int32_t registers)
+{
+    // the registers of FR0 to FR7 a witness names, bit n for FRn
+    const char *before = " (";
+    for (int reg = 0; reg < 8; reg++) {
+        if (((uint32_t)registers >> reg) & 1U) {
+            printf("%sFR%d", before, reg);
+            before = " ";
+        }
+    }
+    putchar(')');
+}
+
 static int print_inspection(const struct inspect_request *request,
                             const struct shckit_text *text,
                             const struct shckit_function *function,
@@ -413,6 +426,10 @@ static int print_inspection(const struct inspect_request *request,
                    (strcmp(each->rule, "small-constant") == 0 ||
                     strcmp(each->rule, "integer-constant") == 0)) {
             printf(" (#%" PRId32 ")", each->value);
+        } else if (each->kind == SHCKIT_OPERAND &&
+                   (strcmp(each->rule, "fipr-unloaded") == 0 ||
+                    strcmp(each->rule, "fipr-shared") == 0)) {
+            print_registers(each->value);
         }
         putchar('\n');
     }

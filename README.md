@@ -42,19 +42,17 @@ build/shckit apply -p drop-inline-align -p align-pool -o patched.src original.sr
 asmsh patched.src -object=patched.obj -cpu=sh4 -endian=little -sjis -private
 ```
 
-[`check`](docs/check.md) refuses lines asmsh may not assemble as written, or the SH-4 may not run as they read. A text it passes can still fail in asmsh, or run otherwise than it reads. [`lint`](docs/lint.md) holds the text people write to a consistent layout. Both name every line they refuse, and change nothing.
+[`check`](docs/check.md) reports unrecognized assembly and control-flow hazards. [`lint`](docs/lint.md) checks the layout of asmsh source. Both name the file and line for each finding.
 
-[`inspect`](docs/inspect.md) looks in one function for an instruction, operands or a use of R15 that no Dreamcast SHC compiler is known to write from C. It asks about them as a family, so it takes no release. It prints the witness, or `none`, and any limit it met, a place it couldn't see past:
+[`inspect`](docs/inspect.md) looks in one function for a pattern no Dreamcast SHC compiler is known to write from C. It prints the matching rule and line, or `none` if no rule matches. It also reports any analysis limit it reached.
 
 ```
 x.src:3: _f: abi: return-above-entry (SP +8)
 ```
 
-"Not known" is the claim: [each rule's evidence](docs/inspect.md#evidence) says what was read for which release and what is inference. `return-above-entry` and `return-below-entry` rest on an [unfinished argument](docs/inspect.md#abi-rules) about SHC 5.0 R10's frames, and on compiles alone for every other release. `integer-constant`, which reads how a constant's register is used, rests on compiles but for R10's expansion of constants.
+Without `--end`, inspection continues to the end of the entry's `.SECTION` block. Give `--end` when another function follows in that block. SHC's inter-module optimizer can produce some of these patterns from C alone. The reference gives the [scope of a match](docs/inspect.md#what-a-witness-claims) and the [evidence for each rule](docs/inspect.md#evidence).
 
-inspect doesn't find where a function ends. Without `--end` it reads to the end of the entry's `.SECTION` block, so give `--end` when another function follows. `none` means no witness, not that SHC compiled the function from C.
-
-[`translate`](docs/translate.md) writes `IN` as GNU as text. For a text asmsh assembles with no error and no warning, binutils' `sh-elf-as` assembles the output to the bytes and relocations asmsh writes, or translate refuses the text, naming the line, or `sh-elf-as` fails, except where a [silent limit](docs/translate.md#limits) applies, the first of them `>>` and `/`: GNU as computes them in 64 bits, where asmsh computes them in 32. It reads the text as `apply` does and computes no address: GNU as lays the text out, and translate writes asmsh's literal pools where asmsh does.
+[`translate`](docs/translate.md) writes `IN` as GNU as text for `sh-elf-as`, with literal pools where asmsh puts them. The [compatibility limits](docs/translate.md#limits) cover cases where the assemblers can produce different bytes.
 
 Every command reads CP932, as SHC writes it, and checks its byte structure, not its characters. It refuses a text with a control character other than a tab or a line end, a byte CP932 doesn't use, a lead byte without its trail, or a last line without a line end.
 

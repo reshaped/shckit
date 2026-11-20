@@ -251,15 +251,23 @@ static const struct {
     {"movca", "MOVCA", SHCKIT_OPCODE},
     {"cache-line", "OCBI OCBP OCBWB", SHCKIT_OPCODE},
     {"sett", "SETT", SHCKIT_OPCODE},
+    {"cmp-str", "CMP/STR", SHCKIT_OPCODE},
     {"fipr-registers", "FIPR", SHCKIT_OPERAND},
+    {"fipr-unloaded", "FIPR", SHCKIT_OPERAND},
+    {"fipr-shared", "FIPR", SHCKIT_OPERAND},
     {"ftrv-registers", "FTRV", SHCKIT_OPERAND},
     {"fsca-registers", "FSCA", SHCKIT_OPERAND},
     {"small-constant", "MOV", SHCKIT_OPERAND},
     {"integer-constant", "MOV", SHCKIT_OPERAND},
     {"zero-displacement", "MOV", SHCKIT_OPERAND},
+    {"fschg-slot", "FSCHG", SHCKIT_OPERAND},
     {"fschg-pairs", "FMOV", SHCKIT_OPERAND},
+    {"fschg-dt", "DT", SHCKIT_OPERAND},
+    {"fschg-stores", "FMOV", SHCKIT_OPERAND},
+    {"fschg-register-moves", "FMOV", SHCKIT_OPERAND},
     {"stack-written", NULL, SHCKIT_ABI},
     {"fpscr-save", "STS LDS", SHCKIT_ABI},
+    {"pr-save-below-branch", "STS", SHCKIT_ABI},
     {"return-above-entry", NULL, SHCKIT_ABI},
     {"return-below-entry", NULL, SHCKIT_ABI},
 };
@@ -361,7 +369,7 @@ static bool named(const struct shckit_witness *witness)
 {
     // whether the witness names what its rule does: R15's offset above the
     // entry, or below it after a return, a constant from -128 to -1, one from
-    // -32768 to 32767 outside it, or nothing
+    // -32768 to 32767 outside it, one or more of FR0 to FR7, or nothing
     if (witness->kind == SHCKIT_NO_WITNESS) {
         return witness->value == 0;
     }
@@ -377,6 +385,10 @@ static bool named(const struct shckit_witness *witness)
     if (strcmp(witness->rule, "integer-constant") == 0) {
         return witness->value >= -32768 && witness->value <= 32767 &&
                (witness->value < -128 || witness->value > -1);
+    }
+    if (strcmp(witness->rule, "fipr-unloaded") == 0 ||
+        strcmp(witness->rule, "fipr-shared") == 0) {
+        return witness->value >= 1 && witness->value <= 255;
     }
     return witness->value == 0;
 }
@@ -437,6 +449,14 @@ static bool rests_on_sz(const struct shckit_witness *witness)
            strcmp(witness->rule, "return-below-entry") == 0;
 }
 
+static bool counts_loads(const struct shckit_witness *witness)
+{
+    // whether the witness rests on a count of the function's loads, which SZ
+    // 1 at the entry reads as pairs
+    return strcmp(witness->rule, "fipr-unloaded") == 0 ||
+           strcmp(witness->rule, "fipr-shared") == 0;
+}
+
 static bool same_limit(const struct shckit_inspection *one,
                        const struct shckit_inspection *two)
 {
@@ -466,9 +486,11 @@ static bool both_sz(const struct shckit_text *text,
 {
     // whether inspect, with SZ unknown, finds what SZ 0 and SZ 1 both find:
     // each witness of a rule that doesn't rest on SZ under both, and of one
-    // that does where both find one at a line, naming the offset nearer the
-    // entry; and the limit of the two at the lower line, or stack-unknown at
-    // a lower one where only one finds a witness of a rule that does
+    // that names R15's offset where both find one at a line, naming the
+    // offset nearer the entry; and the limit of the two at the lower line, or
+    // stack-unknown at a lower one where only one finds a witness of such a
+    // rule. A rule that counts loads finds SZ 0's witnesses, and SZ 1 none
+    // at another line
     struct shckit_function under = *function;
     struct shckit_inspection result;
     struct shckit_inspection runs[2];
@@ -488,6 +510,11 @@ static bool both_sz(const struct shckit_text *text,
     for (size_t i = 0; ok && i < counts[0]; i++) {
         const struct shckit_witness *sz0 = &lists[0][i];
         const struct shckit_witness *sz1 = partner(lists[1], counts[1], sz0);
+        if (counts_loads(sz0)) {
+            ok = kept < count && same_witness(&found[kept], sz0);
+            kept++;
+            continue;
+        }
         if (sz1 == NULL) {
             ok = rests_on_sz(sz0);
             lone = sz0->index < lone ? sz0->index : lone;

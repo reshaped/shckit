@@ -2679,6 +2679,18 @@ static void test_patch_names(void)
 #define F(body) "_f:\n" body
 #define INSPECTS(body, want) inspects(F(body), UNKNOWN, want)
 
+// The loads SHC's template writes above its FIPR FV4,FV0 from 5.0 R26 on,
+// one of each of FR0 to FR7, through the pointers in R4 and R5.
+#define VECTORS                                                                \
+    S("FMOV.S      @R4+,FR0")                                                  \
+    S("FMOV.S      @R5+,FR4")                                                  \
+    S("FMOV.S      @R4+,FR1")                                                  \
+    S("FMOV.S      @R5+,FR5")                                                  \
+    S("FMOV.S      @R4+,FR2")                                                  \
+    S("FMOV.S      @R5+,FR6")                                                  \
+    S("FMOV.S      @R4+,FR3")                                                  \
+    S("FMOV.S      @R5+,FR7")
+
 static bool same_witness(const struct shckit_witness *one,
                          const struct shckit_witness *two)
 {
@@ -2714,6 +2726,16 @@ static void describe(const struct shckit_text *text,
                (strcmp(witness->rule, "small-constant") == 0 ||
                 strcmp(witness->rule, "integer-constant") == 0)) {
         (void)snprintf(got + len, size - len, " #%ld", (long)witness->value);
+    } else if (witness->kind == SHCKIT_OPERAND &&
+               (strcmp(witness->rule, "fipr-unloaded") == 0 ||
+                strcmp(witness->rule, "fipr-shared") == 0)) {
+        // the registers of FR0 to FR7 it names, bit n for FRn
+        for (int reg = 0; reg < 8; reg++) {
+            if (((unsigned long)witness->value >> reg) & 1UL) {
+                len = strlen(got);
+                (void)snprintf(got + len, size - len, " FR%d", reg);
+            }
+        }
     }
 }
 
@@ -2882,6 +2904,88 @@ static void test_inspect_rules(void)
     CHECK(INSPECTS(S("RTS") S("NOP") "L1:\n" S(".DATA.W     H'0018") "; SETT\n",
                    "none"));
 
+    // CMP/STR, in any case and with its size, whichever registers it names,
+    // on a label's line, in a slot and where control never goes
+    static const struct {
+        const char *body;
+        const char *want;
+    } compares[] = {
+        {S("MOV         #0,R2") S("MOV.L       @R4+,R3") S("CMP/STR     R2,R3")
+             S("RTS") S("MOVT        R0"),
+         "opcode cmp-str 4"},
+        {S("cmp/str     r2,r1") S("RTS") S("NOP"), "opcode cmp-str 2"},
+        {S("CMP/STR.L   R4,R6") S("RTS") S("NOP"), "opcode cmp-str 2"},
+        {S("CMP/STR     R15,R15") S("RTS") S("NOP"), "opcode cmp-str 2"},
+        {"L1:       CMP/STR     R5,R6\n" S("RTS") S("NOP"), "opcode cmp-str 2"},
+        {S("RTS") S("CMP/STR     R2,R3"), "opcode cmp-str 3"},
+        {S("RTS") S("NOP") S("CMP/STR     R2,R3"), "opcode cmp-str 4"},
+    };
+    for (size_t i = 0; i < sizeof compares / sizeof compares[0]; i++) {
+        (void)snprintf(in, sizeof in, F("%s"), compares[i].body);
+        CHECK(inspects(in, UNKNOWN, compares[i].want));
+    }
+
+    // each CMP/STR of a loop that looks for a zero byte a word at a time, as
+    // the runtime's string routines do, and the return above the entry of
+    // one that pops what its caller pushed, which the opcode outranks
+    CHECK(inspects_all(
+        F(S("MOV         #0,R6") "L1:\n" S("MOV.L       @R1+,R4") S(
+            "CMP/STR     R4,R6") S("BT          L2") S("MOV.L       @R1+,R5")
+              S("CMP/STR     R5,R6") S("BF          L1") "L2:\n" S("RTS")
+                  S("MOV.L       @R15+,R3")),
+        UNKNOWN,
+        "opcode cmp-str 5, opcode cmp-str 8, abi return-above-entry 12 +4"));
+    CHECK(INSPECTS(S("MOV.L       @R15+,R3") S("RTS") S("CMP/STR     R4,R6"),
+                   "opcode cmp-str 4"));
+
+    // with a register on a continuation line, the witness stands beside the
+    // limit: the rule reads no operand
+    CHECK(INSPECTS(S("CMP/STR     R2,") "+           R3\n" S("RTS") S("NOP"),
+                   "opcode cmp-str 2; continued 2"));
+
+    // but not the other compares, which SHC writes, nor a test of a byte
+    CHECK(INSPECTS(
+        S("CMP/EQ      #0,R0") S("CMP/EQ      R0,R3") S("CMP/GE      R4,R5")
+            S("CMP/GT      R4,R5") S("CMP/HI      R4,R5") S("CMP/HS      R4,R5")
+                S("CMP/PL      R4") S("CMP/PZ      R4") S("FCMP/EQ     FR4,FR5")
+                    S("FCMP/GT     FR4,FR5") S("EXTU.B      R4,R0")
+                        S("TST         R0,R0") S("TST         #255,R0")
+                            S("TAS.B       @R4") S("RTS") S("NOP"),
+        "none"));
+
+    // nor its name in a comment, or in a string, which SHC parts at a line
+    // end so that a line of assembly stays a directive's operand, here in
+    // the function's own section and in the one SHC writes a constant in
+    CHECK(INSPECTS(S("CMP/EQ      R0,R3 ; CMP/STR R0,R3") "; CMP/STR R2,R3\n" S(
+                       "RTS") S("NOP"),
+                   "none"));
+    CHECK(INSPECTS(S("RTS") S("NOP") "L1:\n" S(".SDATA      \"x\"")
+                       S(".DATA.B     H'0A")
+                           S(".SDATA      \"          CMP/STR     R4,R5\"")
+                               S(".DATA.B     H'0A,H'00"),
+                   "none"));
+    CHECK(INSPECTS(S("RTS") S("NOP") DATA "_q1:\n" S(".SDATA      \"A\"")
+                       S(".DATA.B     H'0A")
+                           S(".SDATA      \"          CMP/STR     R0,R1\"")
+                               S(".DATA.B     H'0A,H'00"),
+                   "none"));
+
+    // nor its word in data, a label named for it, or a call of the runtime
+    // routine that holds it, as SHC writes strcmp() of two literals: inspect
+    // reads no name
+    CHECK(INSPECTS(S("RTS") S("NOP") "L1:\n" S(".DATA.W     H'212C"), "none"));
+    CHECK(INSPECTS(S("BRA         CMP_STR") S("NOP") "CMP_STR:\n" S("RTS")
+                       S("NOP"),
+                   "none"));
+    CHECK(INSPECTS(
+        S("STS.L       PR,@-R15") S("MOV.L       L1+8,R3")
+            S("MOV.L       L1+4,R4") S("MOV.L       L1,R5") S("JSR         @R3")
+                S("NOP") S("LDS.L       @R15+,PR") S("RTS") S("NOP") "L1:\n" S(
+                    ".DATA.L     L2") S(".DATA.L     L3")
+                    S(".DATA.L     __quick_strcmp1") "L2:\n" S(
+                        ".SDATA      \"abd\"") "L3:\n" S(".SDATA      \"abc\""),
+        "none; call 6"));
+
     // FSCHG and FRCHG, which R10 writes for its builtins, show nothing
     CHECK(INSPECTS(S("FSCHG") S("RTS") S("NOP"), "none"));
     CHECK(INSPECTS(S("fschg") S("RTS") S("NOP"), "none"));
@@ -2901,8 +3005,8 @@ static void test_inspect_rules(void)
                    "operand fipr-registers 2"));
     CHECK(inspects(F(S("FTRV        XMTRX,FV4") S("RTS") S("NOP")), UNKNOWN,
                    "operand ftrv-registers 2"));
-    CHECK(inspects(F(S("FIPR        FV4,FV0") S("RTS") S("NOP")), UNKNOWN,
-                   "none"));
+    CHECK(inspects(F(VECTORS S("FIPR        FV4,FV0") S("RTS") S("NOP")),
+                   UNKNOWN, "none"));
     CHECK(inspects(F(S("FTRV        XMTRX,FV0") S("RTS") S("NOP")), UNKNOWN,
                    "none"));
 
@@ -2910,7 +3014,7 @@ static void test_inspect_rules(void)
     // excludes
     CHECK(INSPECTS(
         S("FLDI0       FR0") S("FLDI1       FR1") S("FLDI0       FR2")
-            S("FLDI0       FR3") S("FIPR        FV4,FV0")
+            S("FLDI0       FR3") VECTORS S("FIPR        FV4,FV0")
                 S("FTRV        XMTRX,FV0") S("FSCA        FPUL,DR0")
                     S("FSRRA       FR0") S("PREF        @R4")
                         S("LDC         R4,SR") S("STC         SR,R0") S("FRCHG")
@@ -2945,6 +3049,808 @@ static void test_inspect_rules(void)
                    "opcode swap 2; continued 2"));
     CHECK(INSPECTS(S("FIPR        FV8,") "+           FV0\n" S("RTS") S("NOP"),
                    "none; continued 2"));
+}
+
+static void test_inspect_fipr_unloaded(void)
+{
+    // FIPR FV4,FV0 in a function that holds no load of one of FR0 to FR7, a
+    // witness at its line that names each such register, with SZ unknown
+    // and with SZ 0: a register filled by FLDI0 and one left as the caller
+    // had it; registers that hold differences of loads; the FIPR alone; in
+    // any case; in a slot; where control never goes; and past a call
+    static const struct {
+        const char *in;
+        const char *want;
+    } products[] = {
+        {F(S("FMOV.S      @R4+,FR0") S("FLDI0       FR3")
+               S("FMOV.S      @R4+,FR1") S("FMOV.S      @R4+,FR2")
+                   S("FMOV.S      @R5+,FR4") S("FMOV.S      @R5+,FR5")
+                       S("FMOV.S      @R5+,FR6") S("FIPR        FV4,FV0")
+                           S("RTS") S("FMOV.S      FR3,FR0")),
+         "operand fipr-unloaded 9 FR3 FR7"},
+        {F(S("FMOV.S      @R5+,FR0") S("FLDI0       FR3")
+               S("FMOV.S      @R4+,FR8") S("FSUB        FR8,FR0")
+                   S("FLDI0       FR7") S("FMOV.S      @R6+,FR4")
+                       S("FSUB        FR8,FR4") S("FIPR        FV4,FV0")
+                           S("RTS") S("FMOV.S      FR3,FR0")),
+         "operand fipr-unloaded 9 FR1 FR2 FR3 FR5 FR6 FR7"},
+        {F(S("FIPR        FV4,FV0") S("RTS") S("NOP")),
+         "operand fipr-unloaded 2 FR0 FR1 FR2 FR3 FR4 FR5 FR6 FR7"},
+        {F(S("fmov.s      @r4+,fr0") S("fmov        @r4+,fr1")
+               S("fipr.s      fv4,fv0") S("rts") S("nop")),
+         "operand fipr-unloaded 4 FR2 FR3 FR4 FR5 FR6 FR7"},
+        {F(S("FMOV.S      @R4+,FR0") S("RTS") S("FIPR        FV4,FV0")),
+         "operand fipr-unloaded 4 FR1 FR2 FR3 FR4 FR5 FR6 FR7"},
+        {F(S("RTS") S("NOP") S("FIPR        FV4,FV0")),
+         "operand fipr-unloaded 4 FR0 FR1 FR2 FR3 FR4 FR5 FR6 FR7"},
+        {F(S("JSR         @R6") S("NOP") S("FMOV.S      @R4+,FR7")
+               S("FIPR        FV4,FV0") S("RTS") S("NOP")),
+         "operand fipr-unloaded 5 FR0 FR1 FR2 FR3 FR4 FR5 FR6; call 2"},
+    };
+    static const int szs[] = {UNKNOWN, SHCKIT_SZ_0, SHCKIT_SZ_1};
+    static const int singles[] = {UNKNOWN, SHCKIT_SZ_0};
+    for (size_t i = 0; i < sizeof products / sizeof products[0]; i++) {
+        for (size_t j = 0; j < sizeof singles / sizeof singles[0]; j++) {
+            CHECK(inspects(products[i].in, singles[j], products[i].want));
+        }
+    }
+
+    // what is no load of them: a store, a move between registers, FLDI1,
+    // FLOAT and FSTS, a load of FR8 to FR15 and a load of XD8 to XD14
+    CHECK(INSPECTS(S("FMOV.S      FR0,@R4") S("FMOV.S      FR1,@-R4")
+                       S("FMOV.S      FR8,FR2") S("FLDI1       FR3") S(
+                           "FLOAT       FPUL,FR4") S("FSTS        FPUL,FR5")
+                           S("FMOV.S      @R5+,FR14") S("FMOV        @R5+,XD14")
+                               S("FIPR        FV4,FV0") S("RTS") S("NOP"),
+                   "operand fipr-unloaded 10 FR0 FR1 FR2 FR3 FR4 FR5 FR6 FR7"));
+
+    // a load of XDn is one of FRn+1 under any SZ: FMOV @Rm+,XD0 and
+    // FMOV.S @Rm+,FR1 are one word, which with SZ 0 moves FR1, so the loads
+    // of SHC's template, spelled as with SZ 1, show nothing
+    static const char extended[] =
+        F(S("FMOV.S      @R4+,FR0") S("FMOV        @R4+,XD0")
+              S("FMOV.S      @R4+,FR2") S("FMOV        @R4+,XD2")
+                  S("FMOV.S      @R5+,FR4") S("FMOV        @R5+,XD4")
+                      S("FMOV.S      @R5+,FR6") S("FMOV        @R5+,XD6")
+                          S("FIPR        FV4,FV0") S("RTS") S("NOP"));
+    for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
+        CHECK(inspects(extended, szs[j], "none"));
+    }
+
+    // a load of DRn is one of FRn and of FRn+1 under any SZ. A load of an
+    // even FRn is one of FRn alone, but where SZ may be 1 at it, when the
+    // same word moves the pair: with SZ 1 at the entry it counts for FRn+1
+    // too
+    static const char pairs[] =
+        F(S("FMOV        @R4+,DR0") S("FMOV.D      @R4+,DR2") S(
+            "FMOV        @R5+,DR4") S("FIPR        FV4,FV0") S("RTS") S("NOP"));
+    static const char evens[] =
+        F(S("FMOV.S      @R4+,FR0") S("FMOV.S      @R4+,FR2")
+              S("FMOV.S      @R5+,FR4") S("FMOV.S      @R5+,FR5")
+                  S("FIPR        FV4,FV0") S("RTS") S("NOP"));
+    for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
+        CHECK(inspects(pairs, szs[j], "operand fipr-unloaded 5 FR6 FR7"));
+    }
+    for (size_t j = 0; j < sizeof singles / sizeof singles[0]; j++) {
+        CHECK(inspects(evens, singles[j],
+                       "operand fipr-unloaded 6 FR1 FR3 FR6 FR7"));
+    }
+    CHECK(inspects(evens, SHCKIT_SZ_1, "operand fipr-unloaded 6 FR6 FR7"));
+    CHECK(inspects(products[0].in, SHCKIT_SZ_1, "none"));
+
+    // each FIPR FV4,FV0 of the function, and no FIPR with other operands,
+    // which is fipr-registers' alone
+    CHECK(inspects_all(
+        F(S("FLDI0       FR7") S("FIPR        FV4,FV0") S("FMOV.S      FR3,FR8")
+              S("FIPR        FV4,FV0") S("FIPR        FV4,FV4") S("RTS")
+                  S("NOP")),
+        UNKNOWN,
+        "operand fipr-unloaded 3 FR0 FR1 FR2 FR3 FR4 FR5 FR6 FR7, operand "
+        "fipr-unloaded 5 FR0 FR1 FR2 FR3 FR4 FR5 FR6 FR7, operand "
+        "fipr-registers 6"));
+
+    // an opcode outranks it, and of two operand witnesses the first line's
+    // is the one reported
+    CHECK(INSPECTS(S("FIPR        FV4,FV0") S("SETT") S("RTS") S("NOP"),
+                   "opcode sett 3"));
+    CHECK(INSPECTS(S("FIPR        FV8,FV0") S("FIPR        FV4,FV0") S("RTS")
+                       S("NOP"),
+                   "operand fipr-registers 2"));
+
+    // no witness: a load of each register, as SHC's template writes them;
+    // through @Rm and @(R0,Rm); below the FIPR, where SHC's scheduler can
+    // leave them; where control never goes; and with the last in the slot of
+    // a branch to the FIPR
+    static const char *const loaded[] = {
+        F(VECTORS S("FIPR        FV4,FV0") S("RTS") S("FMOV.S      FR3,FR0")),
+        F(S("MOV         #4,R0") S("FMOV.S      @R4,FR0")
+              S("FMOV.S      @R5,FR4") S("FMOV.S      @(R0,R4),FR1")
+                  S("FMOV.S      @(R0,R5),FR5") S("MOV         #8,R0") S(
+                      "FMOV.S      @(R0,R4),FR2") S("FMOV.S      @(R0,R5),FR6")
+                      S("FMOV.S      @R6,FR3") S("FMOV.S      @R7+,FR7")
+                          S("FIPR        FV4,FV0") S("RTS") S("NOP")),
+        F(S("FIPR        FV4,FV0") VECTORS S("RTS") S("NOP")),
+        F(S("FIPR        FV4,FV0") S("RTS") S("NOP") VECTORS),
+        F(S("FMOV.S      @R4+,FR0") S("FMOV.S      @R5+,FR4")
+              S("FMOV.S      @R4+,FR1") S("FMOV.S      @R5+,FR5")
+                  S("FMOV.S      @R4+,FR2") S("FMOV.S      @R5+,FR6") S(
+                      "FMOV.S      @R4+,FR3") S("BRA         L1")
+                      S("FMOV.S      @R5+,FR7") "L1:\n" S("FIPR        FV4,FV0")
+                          S("RTS") S("NOP")),
+    };
+    for (size_t i = 0; i < sizeof loaded / sizeof loaded[0]; i++) {
+        for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
+            CHECK(inspects(loaded[i], szs[j], "none"));
+        }
+    }
+
+    // nor where a register is filled otherwise above the FIPR and loaded
+    // anywhere in the function: the rule follows no path
+    CHECK(INSPECTS(S("FLDI0       FR3") S("FLDI0       FR7")
+                       S("FIPR        FV4,FV0") VECTORS S("RTS") S("NOP"),
+                   "none"));
+
+    // where the function holds an FSCHG or a write of FPSCR, anywhere, SZ
+    // may be 1 at a load too, whatever SZ the entry has: R10 loads pairs
+    // between its FSCHGs, which a text written from bytes may spell as
+    // singles. A read of FPSCR changes nothing.
+    static const char *const sets[] = {
+        S("FSCHG"),
+        S("LDS         R0,FPSCR"),
+        S("LDS.L       @R1+,FPSCR"),
+    };
+    char in[512];
+    for (size_t i = 0; i < sizeof sets / sizeof sets[0]; i++) {
+        (void)snprintf(
+            in, sizeof in,
+            F("%s" S("FMOV.S      @R2+,FR4") S("FMOV.S      @R2+,FR6")
+                  S("FMOV.S      @R3+,FR0") S("FMOV.S      @R3+,FR2")
+                      S("FIPR        FV4,FV0") S("RTS") S("NOP")),
+            sets[i]);
+        for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
+            CHECK(inspects(in, szs[j], "none"));
+        }
+        (void)snprintf(in, sizeof in,
+                       F(S("FMOV.S      @R2+,FR5") S("FMOV.S      @R3+,FR0")
+                             S("FMOV.S      @R3+,FR2") S("FIPR        FV4,FV0")
+                                 S("RTS") S("NOP") "%s"),
+                       sets[i]);
+        for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
+            CHECK(inspects(in, szs[j], "operand fipr-unloaded 5 FR4 FR6 FR7"));
+        }
+    }
+    CHECK(INSPECTS(S("STS         FPSCR,R0") S("FMOV.S      @R2+,FR4")
+                       S("FMOV.S      @R2+,FR6") S("FMOV.S      @R3+,FR0")
+                           S("FMOV.S      @R3+,FR2") S("FIPR        FV4,FV0")
+                               S("RTS") S("NOP"),
+                   "operand fipr-unloaded 7 FR1 FR3 FR5 FR7"));
+
+    // data and comments hold no FIPR and no load, and an instruction in a
+    // data section is none
+    CHECK(INSPECTS(
+        S("RTS") S("NOP") "L1:\n" S(".DATA.W     H'F4ED") "; FIPR FV4,FV0\n",
+        "none"));
+    CHECK(INSPECTS(S("RTS") S("NOP") DATA S("FIPR        FV4,FV0"), "none"));
+    CHECK(INSPECTS(S("FIPR        FV4,FV0") S("RTS") S("NOP") "L1:\n" S(
+                       ".DATA.W     H'F049") "; FMOV.S @R4+,FR0\n" DATA VECTORS,
+                   "operand fipr-unloaded 2 FR0 FR1 FR2 FR3 FR4 FR5 FR6 FR7"));
+
+    // with a continuation below it, a FIPR can't be read, and an FMOV
+    // counts as a load of each register; an LDS that a continuation joins
+    // writes FPSCR all the same
+    CHECK(INSPECTS(S("FIPR        FV4,") "+           FV0\n" S("RTS") S("NOP"),
+                   "none; continued 2"));
+    CHECK(INSPECTS(S("FMOV.S      FR0,") "+           FR1\n" S(
+                       "FIPR        FV4,FV0") S("RTS") S("NOP"),
+                   "none; continued 2"));
+    CHECK(INSPECTS(S("LDS         R0,") "+           FPSCR\n" S(
+                       "FMOV.S      @R2+,FR4") S("FMOV.S      @R2+,FR6")
+                       S("FMOV.S      @R3+,FR0") S("FMOV.S      @R3+,FR2")
+                           S("FIPR        FV4,FV0") S("RTS") S("NOP"),
+                   "none; continued 2"));
+
+    // the function's lines are the caller's to know, and the rule counts
+    // the loads among them alone. Under 5.0 R26 -cpu=sh4 -optimize=1 -speed
+    // -fpu=single, void r_two(float *a, float *b, int k)
+    // { if (k) { _builtin_fipr(a, b); return; } _builtin_fipr(b, a); }, above
+    // a function that loads the eight registers: read whole it shows
+    // nothing, and from L354, the label of the FIPR its arms share, the
+    // witness; read from there with the function below, it counts that
+    // one's loads
+    static const char arms[] = "_r_two:\n"
+                               "          TST         R6,R6\n"
+                               "          BT          L333\n"
+                               "          FMOV.S      @R5+,FR4\n"
+                               "          FMOV.S      @R4+,FR0\n"
+                               "          FMOV.S      @R5+,FR5\n"
+                               "          FMOV.S      @R4+,FR1\n"
+                               "          FMOV.S      @R5+,FR6\n"
+                               "          FMOV.S      @R4+,FR2\n"
+                               "          FMOV.S      @R5+,FR7\n"
+                               "          BRA         L354\n"
+                               "          FMOV.S      @R4+,FR3\n"
+                               "L333:\n"
+                               "          FMOV.S      @R5+,FR0\n"
+                               "          FMOV.S      @R4+,FR4\n"
+                               "          FMOV.S      @R5+,FR1\n"
+                               "          FMOV.S      @R4+,FR5\n"
+                               "          FMOV.S      @R5+,FR2\n"
+                               "          FMOV.S      @R4+,FR6\n"
+                               "          FMOV.S      @R5+,FR3\n"
+                               "          FMOV.S      @R4+,FR7\n"
+                               "L354:\n"
+                               "          FIPR        FV4,FV0\n"
+                               "          RTS\n"
+                               "          NOP\n"
+                               "_g:\n" VECTORS S("RTS") S("NOP");
+    CHECK(inspects_lines(arms, 0, 25, UNKNOWN, "none"));
+    CHECK(inspects_lines(arms, 21, 25, UNKNOWN,
+                         "operand fipr-unloaded 23 FR0 FR1 FR2 FR3 FR4 FR5 FR6 "
+                         "FR7"));
+    CHECK(inspects_lines(arms, 21, 0, UNKNOWN, "none"));
+}
+
+static void test_inspect_fipr_unloaded_compiled(void)
+{
+    // what SHC writes for C, cut down, which the rule may not witness
+    static const struct {
+        const char *in;
+        const char *want;
+    } compiled[] = {
+        // under 5.0 R26 -cpu=sh4 -optimize=1 -speed, float p_one(float *p,
+        // float *b, float x) { p[0] = x; return _builtin_fipr(p, b); }: the
+        // store right above the template stays a store and a load
+        {"_p_one:\n"
+         "          FMOV.S      FR4,@R4\n"
+         "          FMOV.S      @R4+,FR0\n"
+         "          FMOV.S      @R5+,FR4\n"
+         "          FMOV.S      @R4+,FR1\n"
+         "          FMOV.S      @R5+,FR5\n"
+         "          FMOV.S      @R4+,FR2\n"
+         "          FMOV.S      @R5+,FR6\n"
+         "          FMOV.S      @R4+,FR3\n"
+         "          FMOV.S      @R5+,FR7\n"
+         "          FIPR        FV4,FV0\n"
+         "          RTS\n"
+         "          FMOV.S      FR3,FR0\n",
+         "none"},
+        // under 5.0 R10 -cpu=sh4 -optimize=1 -speed -double=float, the same
+        // function: R10's template loads four pairs between its FSCHGs
+        {"_p_one:\n"
+         "          ADD         #-8,R15\n"
+         "          MOV.L       R4,@R15\n"
+         "          MOV.L       R5,@(4,R15)\n"
+         "          MOV.L       @R15,R3\n"
+         "          FMOV.S      FR4,@R3\n"
+         "          MOV.L       @R15,R3\n"
+         "          MOV.L       @(4,R15),R2\n"
+         "          FSCHG\n"
+         "          FMOV        @R2+,DR4\n"
+         "          FMOV        @R2+,DR6\n"
+         "          FMOV        @R3+,DR0\n"
+         "          FMOV        @R3+,DR2\n"
+         "          FIPR        FV4,FV0\n"
+         "          FSCHG\n"
+         "          FMOV.S      FR3,FR0\n"
+         "          RTS\n"
+         "          ADD         #8,R15\n",
+         "none"},
+        // under 5.1 R13 -cpu=sh4 -optimize=1 -speed -fpu=single,
+        // float p_push4(float *p, float *b, float x, float y, float z,
+        // float w) { *--p = w; *--p = z; *--p = y; *--p = x;
+        // return _builtin_fipr(p, b); }: four pushes through R1 and the
+        // template's four pops through it, each kept
+        {"_p_push4:\n"
+         "          ADD         #-4,R15\n"
+         "          MOV         R4,R1\n"
+         "          MOV.L       R5,@R15\n"
+         "          FMOV.S      FR7,@-R1\n"
+         "          FMOV.S      FR6,@-R1\n"
+         "          FMOV.S      FR5,@-R1\n"
+         "          FMOV.S      FR4,@-R1\n"
+         "          MOV.L       @R15,R3\n"
+         "          FMOV.S      @R1+,FR0\n"
+         "          FMOV.S      @R3+,FR4\n"
+         "          FMOV.S      @R1+,FR1\n"
+         "          FMOV.S      @R3+,FR5\n"
+         "          FMOV.S      @R1+,FR2\n"
+         "          FMOV.S      @R3+,FR6\n"
+         "          FMOV.S      @R1+,FR3\n"
+         "          FMOV.S      @R3+,FR7\n"
+         "          FIPR        FV4,FV0\n"
+         "          FMOV.S      FR3,FR0\n"
+         "          RTS\n"
+         "          ADD         #4,R15\n",
+         "none"},
+        // and float t_loc(float *a) { float v[4]; _builtin_ftrv(a, v);
+        // return _builtin_fipr(v, v); }: FTRV's result is stored and loaded
+        // again, into both vectors
+        {"_t_loc:\n"
+         "          ADD         #-16,R15\n"
+         "          FMOV.S      @R4+,FR0\n"
+         "          MOV         R15,R0\n"
+         "          MOV         R0,R3\n"
+         "          ADD         #16,R3\n"
+         "          FMOV.S      @R4+,FR1\n"
+         "          MOV         R0,R1\n"
+         "          MOV         R0,R2\n"
+         "          FMOV.S      @R4+,FR2\n"
+         "          FMOV.S      @R4+,FR3\n"
+         "          FTRV        XMTRX,FV0\n"
+         "          FMOV.S      FR3,@-R3\n"
+         "          FMOV.S      FR2,@-R3\n"
+         "          FMOV.S      FR1,@-R3\n"
+         "          FMOV.S      FR0,@-R3\n"
+         "          FMOV.S      @R2+,FR0\n"
+         "          FMOV.S      @R1+,FR4\n"
+         "          FMOV.S      @R2+,FR1\n"
+         "          FMOV.S      @R1+,FR5\n"
+         "          FMOV.S      @R2+,FR2\n"
+         "          FMOV.S      @R1+,FR6\n"
+         "          FMOV.S      @R2+,FR3\n"
+         "          FMOV.S      @R1+,FR7\n"
+         "          FIPR        FV4,FV0\n"
+         "          FMOV.S      FR3,FR0\n"
+         "          RTS\n"
+         "          ADD         #16,R15\n",
+         "none"},
+        // and float q_before16(float *a, float *b, float x, float y)
+        // { x /= y; ... return _builtin_fipr(a, b) + x; }, with sixteen
+        // divisions, four of them here: the scheduler gives up and leaves
+        // the FIPR above its own loads, where it reads eight registers as
+        // the entry left them
+        {"_q_before16:\n"
+         "          FMOV.S      FR15,@-R15\n"
+         "          ADD         #-8,R15\n"
+         "          FIPR        FV4,FV0\n"
+         "          FMOV.S      FR3,FR0\n"
+         "          FADD        FR15,FR0\n"
+         "          FMOV.S      FR4,FR15\n"
+         "          FDIV        FR5,FR15\n"
+         "          MOV         R5,R2\n"
+         "          MOV.L       R4,@R15\n"
+         "          MOV.L       R5,@(4,R15)\n"
+         "          MOV.L       @R15,R3\n"
+         "          FMOV.S      @R2+,FR4\n"
+         "          FMOV.S      @R3+,FR0\n"
+         "          FMOV.S      @R3+,FR1\n"
+         "          FMOV.S      @R3+,FR2\n"
+         "          FMOV.S      @R3+,FR3\n"
+         "          FDIV        FR5,FR15\n"
+         "          FDIV        FR5,FR15\n"
+         "          FDIV        FR5,FR15\n"
+         "          FMOV.S      @R2+,FR5\n"
+         "          FMOV.S      @R2+,FR6\n"
+         "          FMOV.S      @R2+,FR7\n"
+         "          ADD         #8,R15\n"
+         "          RTS\n"
+         "          FMOV.S      @R15+,FR15\n",
+         "none"},
+        // under 5.0 R32 -cpu=sh4 -optimize=1 -size -fpu=single
+        // -denormalize=on, float s_tern(float *a, float *b, float *c, int k)
+        // { return k ? _builtin_fipr(a, b) : _builtin_fipr(a, c); }: each
+        // arm keeps its loads, one in the slot of its BRA, and the two share
+        // one FIPR under a label
+        {"_s_tern:\n"
+         "          ADD         #-16,R15\n"
+         "          MOV         R7,R3\n"
+         "          TST         R3,R3\n"
+         "          MOV.L       R4,@R15\n"
+         "          MOV.L       R5,@(8,R15)\n"
+         "          MOV.L       R6,@(4,R15)\n"
+         "          BT/S        L406\n"
+         "          MOV.L       R7,@(12,R15)\n"
+         "          MOV.L       @(8,R15),R2\n"
+         "          MOV.L       @R15,R3\n"
+         "          FMOV.S      @R2+,FR4\n"
+         "          FMOV.S      @R3+,FR0\n"
+         "          FMOV.S      @R2+,FR5\n"
+         "          FMOV.S      @R3+,FR1\n"
+         "          FMOV.S      @R2+,FR6\n"
+         "          FMOV.S      @R3+,FR2\n"
+         "          FMOV.S      @R2+,FR7\n"
+         "          BRA         L444\n"
+         "          FMOV.S      @R3+,FR3\n"
+         "L406:\n"
+         "          MOV.L       @(4,R15),R3\n"
+         "          MOV.L       @R15,R1\n"
+         "          FMOV.S      @R3+,FR4\n"
+         "          FMOV.S      @R1+,FR0\n"
+         "          FMOV.S      @R3+,FR5\n"
+         "          FMOV.S      @R1+,FR1\n"
+         "          FMOV.S      @R3+,FR6\n"
+         "          FMOV.S      @R1+,FR2\n"
+         "          FMOV.S      @R3+,FR7\n"
+         "          FMOV.S      @R1+,FR3\n"
+         "L444:\n"
+         "          FIPR        FV4,FV0\n"
+         "          FMOV.S      FR3,FR0\n"
+         "          RTS\n"
+         "          ADD         #16,R15\n",
+         "none"},
+    };
+    for (size_t i = 0; i < sizeof compiled / sizeof compiled[0]; i++) {
+        CHECK(inspects(compiled[i].in, UNKNOWN, compiled[i].want));
+    }
+
+    // inline text, which SHC copies as written, holds the witness: 1.20J
+    // ninja.lib's njInnerProduct_ as its #pragma inline_asm body builds
+    // under R10, which fills FR3 and FR7 by FLDI0
+    static const char member[] =
+        F("    MOV         #4,R0\n"
+          "    FMOV.S      @R4,FR0\n"
+          "    FMOV.S      @R5,FR4\n"
+          "    FMOV.S      @(R0,R4),FR1\n"
+          "    FMOV.S      @(R0,R5),FR5\n"
+          "    MOV         #8,R0\n"
+          "    FLDI0       FR7\n"
+          "    FMOV.S      @(R0,R4),FR2\n"
+          "    FMOV.S      @(R0,R5),FR6\n"
+          "    FLDI0       FR3\n"
+          "    FIPR        FV4,FV0\n"
+          "    RTS\n"
+          "    FMOV.S      FR3,FR0\n" ALIGN S("RTS") S("NOP"));
+    CHECK(inspects(member, UNKNOWN, "operand fipr-unloaded 12 FR3 FR7"));
+
+    // and so does a routine the inter-module optimizer made, which no
+    // compiler wrote and no text shows: under 5.1 R13 with -goptimize,
+    // optlnksh -optimize=same_code -samesize=8 moves the block below a
+    // shared FIPR, three times in one function, into _com_opt1
+    static const char routine[] = "_com_opt1:\n"
+                                  "          FIPR        FV4,FV0\n"
+                                  "          FMOV.S      FR3,FR4\n"
+                                  "          FMUL        FR4,FR3\n"
+                                  "          FMOV.S      FR4,FR0\n"
+                                  "          FMOV.S      FR4,FR2\n"
+                                  "          FMAC        FR0,FR3,FR2\n"
+                                  "          RTS\n"
+                                  "          NOP\n";
+    CHECK(inspects(routine, UNKNOWN,
+                   "operand fipr-unloaded 2 FR0 FR1 FR2 FR3 FR4 FR5 FR6 FR7"));
+}
+
+static void test_inspect_fipr_shared(void)
+{
+    // FIPR FV4,FV0 past the loads of one of FR0 to FR7, in a function that
+    // holds fewer loads of it than FIPRs and one at least: a witness at each
+    // FIPR below the last one its loads feed, a load to each FIPR in line
+    // order, naming each such register, with SZ unknown and with SZ 0. One
+    // vector loaded once for two products, and for three; a register loaded
+    // twice for three; a FIPR above the one template, and in the slot below
+    // it
+    static const struct {
+        const char *in;
+        const char *want;
+    } products[] = {
+        {F(VECTORS S("FIPR        FV4,FV0") S("FMOV.S      FR3,FR8")
+               S("FMOV.S      @R6+,FR0") S("FMOV.S      @R6+,FR1")
+                   S("FMOV.S      @R6+,FR2") S("FMOV.S      @R6+,FR3")
+                       S("FIPR        FV4,FV0") S("FADD        FR3,FR8")
+                           S("RTS") S("FMOV.S      FR8,FR0")),
+         "operand fipr-shared 16 FR4 FR5 FR6 FR7"},
+        {F(VECTORS S("FIPR        FV4,FV0") S("FMOV.S      FR3,@R6")
+               S("FMOV.S      @R4+,FR0") S("FMOV.S      @R4+,FR1")
+                   S("FMOV.S      @R4+,FR2") S("FMOV.S      @R4+,FR3")
+                       S("FIPR        FV4,FV0") S("FMOV.S      FR3,@R7") S(
+                           "FMOV.S      @R4+,FR0") S("FMOV.S      @R4+,FR1")
+                           S("FMOV.S      @R4+,FR2") S("FMOV.S      @R4+,FR3")
+                               S("FIPR        FV4,FV0") S("RTS")
+                                   S("FMOV.S      FR3,FR0")),
+         "operand fipr-shared 16 FR4 FR5 FR6 FR7, operand fipr-shared 22 FR4 "
+         "FR5 FR6 FR7"},
+        {F(VECTORS S("FIPR        FV4,FV0") VECTORS S("FIPR        FV4,FV0")
+               S("FMOV.S      @R4+,FR0") S("FMOV.S      @R4+,FR1")
+                   S("FMOV.S      @R4+,FR2") S("FIPR        FV4,FV0") S("RTS")
+                       S("NOP")),
+         "operand fipr-shared 23 FR3 FR4 FR5 FR6 FR7"},
+        {F(S("FIPR        FV4,FV0") VECTORS S("FIPR        FV4,FV0") S("RTS")
+               S("NOP")),
+         "operand fipr-shared 11 FR0 FR1 FR2 FR3 FR4 FR5 FR6 FR7"},
+        {F(VECTORS S("FIPR        FV4,FV0") S("RTS") S("FIPR        FV4,FV0")),
+         "operand fipr-shared 12 FR0 FR1 FR2 FR3 FR4 FR5 FR6 FR7"},
+    };
+    static const int szs[] = {UNKNOWN, SHCKIT_SZ_0, SHCKIT_SZ_1};
+    static const int singles[] = {UNKNOWN, SHCKIT_SZ_0};
+    for (size_t i = 0; i < sizeof products / sizeof products[0]; i++) {
+        for (size_t j = 0; j < sizeof singles / sizeof singles[0]; j++) {
+            CHECK(inspects_all(products[i].in, singles[j], products[i].want));
+        }
+    }
+
+    // with SZ 1 at the entry, a load of an even FRn counts for FRn+1 too:
+    // of the first function's second vector, FR5 and FR7 have two loads
+    CHECK(inspects_all(products[0].in, SHCKIT_SZ_1,
+                       "operand fipr-shared 16 FR4 FR6"));
+
+    // a register with no load is fipr-unloaded's at every FIPR, listed
+    // first, and fipr-shared names the others
+    CHECK(inspects_all(
+        F(S("FMOV.S      @R4+,FR0") S("FMOV.S      @R4+,FR1")
+              S("FMOV.S      @R4+,FR2") S("FMOV.S      @R4+,FR3")
+                  S("FIPR        FV4,FV0") S("FMOV.S      FR3,FR8")
+                      S("FMOV.S      @R4+,FR0") S("FMOV.S      @R4+,FR1")
+                          S("FMOV.S      @R5+,FR6") S("FIPR        FV4,FV0")
+                              S("RTS") S("NOP")),
+        UNKNOWN,
+        "operand fipr-unloaded 6 FR4 FR5 FR7, operand fipr-unloaded 11 FR4 "
+        "FR5 FR7, operand fipr-shared 11 FR2 FR3 FR6"));
+
+    // a load of DRn is one of FRn and of FRn+1, and where the function holds
+    // an FSCHG so is a load of an even FRn
+    CHECK(
+        INSPECTS(S("FSCHG") S("FMOV        @R2+,DR4") S("FMOV        @R2+,DR6")
+                     S("FMOV        @R3+,DR0") S("FMOV        @R3+,DR2")
+                         S("FIPR        FV4,FV0") S("FMOV        @R3+,DR0")
+                             S("FMOV.S      @R3+,FR2") S("FIPR        FV4,FV0")
+                                 S("FSCHG") S("RTS") S("NOP"),
+                 "operand fipr-shared 10 FR4 FR5 FR6 FR7"));
+
+    // no witness: as many loads of each register as FIPRs, or more, wherever
+    // they stand; a FIPR with other operands, which is no FIPR FV4,FV0 and
+    // fipr-registers' alone
+    static const struct {
+        const char *in;
+        const char *want;
+    } others[] = {
+        {F(VECTORS S("FIPR        FV4,FV0") VECTORS S("FIPR        FV4,FV0")
+               S("RTS") S("NOP")),
+         "none"},
+        {F(S("FIPR        FV4,FV0") S("FIPR        FV4,FV0")
+               VECTORS VECTORS S("RTS") S("NOP")),
+         "none"},
+        {F(VECTORS VECTORS S("FIPR        FV4,FV0") S("RTS") S("NOP")), "none"},
+        {F(VECTORS S("FIPR        FV4,FV0") S("FIPR        FV4,FV4") S("RTS")
+               S("NOP")),
+         "operand fipr-registers 11"},
+    };
+    for (size_t i = 0; i < sizeof others / sizeof others[0]; i++) {
+        for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
+            CHECK(inspects_all(others[i].in, szs[j], others[i].want));
+        }
+    }
+
+    // a FIPR in a data section isn't counted, nor one with a continuation
+    // below it, which can't be read; an FMOV with one counts as a load of
+    // each register
+    CHECK(INSPECTS(VECTORS S("FIPR        FV4,FV0") S("RTS") S("NOP")
+                       DATA S("FIPR        FV4,FV0"),
+                   "none"));
+    CHECK(INSPECTS(VECTORS S("FIPR        FV4,") "+           FV0\n" S(
+                       "FIPR        FV4,FV0") S("RTS") S("NOP"),
+                   "none; continued 10"));
+    CHECK(INSPECTS(VECTORS S("FIPR        FV4,FV0")
+                       S("FMOV.S      FR3,") "+           FR8\n" S(
+                           "FIPR        FV4,FV0") S("RTS") S("NOP"),
+                   "none; continued 11"));
+
+    // the function's lines are the caller's to know. Read with the function
+    // below it, a function that loads nothing counts that one's loads, and
+    // the witness is fipr-shared's, at the lower function's FIPR
+    static const char both[] =
+        F(S("FIPR        FV4,FV0") S("RTS")
+              S("FMOV.S      FR3,FR0") "_g:\n" VECTORS S("FIPR        FV4,FV0")
+                  S("RTS") S("FMOV.S      FR3,FR0"));
+    CHECK(inspects_lines(both, 0, 4, UNKNOWN,
+                         "operand fipr-unloaded 2 FR0 FR1 FR2 FR3 FR4 FR5 FR6 "
+                         "FR7"));
+    CHECK(inspects_lines(both, 4, 0, UNKNOWN, "none"));
+    CHECK(inspects_lines(both, 0, 0, UNKNOWN,
+                         "operand fipr-shared 14 FR0 FR1 FR2 FR3 FR4 FR5 FR6 "
+                         "FR7"));
+}
+
+static void test_inspect_fipr_shared_compiled(void)
+{
+    // what SHC writes for C, cut down, which the rule may not witness
+    static const char *const compiled[] = {
+        // under 5.0 R26 -cpu=sh4 -optimize=1 -speed, float s_twice(float *a,
+        // float *b) { return _builtin_fipr(a, b) + _builtin_fipr(a, b); }:
+        // the same call twice loads sixteen registers
+        "_s_twice:\n"
+        "          MOV         R5,R2\n"
+        "          MOV         R4,R3\n"
+        "          FMOV.S      @R3+,FR0\n"
+        "          MOV         R4,R1\n"
+        "          FMOV.S      @R2+,FR4\n"
+        "          MOV         R5,R0\n"
+        "          FMOV.S      @R3+,FR1\n"
+        "          FMOV.S      @R2+,FR5\n"
+        "          FMOV.S      @R3+,FR2\n"
+        "          FMOV.S      @R2+,FR6\n"
+        "          FMOV.S      @R3+,FR3\n"
+        "          FMOV.S      @R2+,FR7\n"
+        "          FIPR        FV4,FV0\n"
+        "          FMOV.S      @R0+,FR4\n"
+        "          FMOV.S      @R1+,FR0\n"
+        "          FMOV.S      @R0+,FR5\n"
+        "          FMOV.S      @R1+,FR1\n"
+        "          FMOV.S      @R0+,FR6\n"
+        "          FMOV.S      @R1+,FR2\n"
+        "          FMOV.S      FR3,FR8\n"
+        "          FMOV.S      @R1+,FR3\n"
+        "          FMOV.S      @R0+,FR7\n"
+        "          FIPR        FV4,FV0\n"
+        "          FADD        FR3,FR8\n"
+        "          RTS\n"
+        "          FMOV.S      FR8,FR0\n",
+        // and void x_drop(float *a, float *b) { _builtin_fipr(a, b);
+        // _builtin_fipr(b, a); }: a dropped result keeps its loads, and R26
+        // puts the last FIPR in the slot of the RTS
+        "_x_drop:\n"
+        "          MOV         R5,R0\n"
+        "          MOV         R4,R1\n"
+        "          FMOV.S      @R1+,FR0\n"
+        "          FMOV.S      @R0+,FR4\n"
+        "          FMOV.S      @R1+,FR1\n"
+        "          FMOV.S      @R0+,FR5\n"
+        "          FMOV.S      @R1+,FR2\n"
+        "          FMOV.S      @R0+,FR6\n"
+        "          FMOV.S      @R1+,FR3\n"
+        "          FMOV.S      @R0+,FR7\n"
+        "          FIPR        FV4,FV0\n"
+        "          FMOV.S      @R5+,FR0\n"
+        "          FMOV.S      @R4+,FR4\n"
+        "          FMOV.S      @R5+,FR1\n"
+        "          FMOV.S      @R4+,FR5\n"
+        "          FMOV.S      @R5+,FR2\n"
+        "          FMOV.S      @R4+,FR6\n"
+        "          FMOV.S      @R5+,FR3\n"
+        "          FMOV.S      @R4+,FR7\n"
+        "          RTS\n"
+        "          FIPR        FV4,FV0\n",
+        // under 5.0 R10 -cpu=sh4 -optimize=1 -speed -double=float,
+        // float s_tern(float *a, float *b, float *c, int k)
+        // { return k ? _builtin_fipr(a, b) : _builtin_fipr(a, c); }: R10
+        // joins the tails of the two arms, which share one FIPR and keep
+        // their loads
+        "_s_tern:\n"
+        "          ADD         #-16,R15\n"
+        "          MOV         R7,R3\n"
+        "          MOV.L       R4,@R15\n"
+        "          TST         R3,R3\n"
+        "          MOV.L       R5,@(8,R15)\n"
+        "          MOV.L       R6,@(4,R15)\n"
+        "          BT/S        L404\n"
+        "          MOV.L       R7,@(12,R15)\n"
+        "          MOV.L       @R15,R3\n"
+        "          MOV.L       @(8,R15),R2\n"
+        "          FSCHG\n"
+        "          FMOV        @R2+,DR4\n"
+        "          FMOV        @R2+,DR6\n"
+        "          FMOV        @R3+,DR0\n"
+        "          FMOV        @R3+,DR2\n"
+        "          BRA         L442\n"
+        "          NOP\n"
+        "L404:\n"
+        "          MOV.L       @R15,R1\n"
+        "          MOV.L       @(4,R15),R3\n"
+        "          FSCHG\n"
+        "          FMOV        @R3+,DR4\n"
+        "          FMOV        @R3+,DR6\n"
+        "          FMOV        @R1+,DR0\n"
+        "          FMOV        @R1+,DR2\n"
+        "L442:\n"
+        "          FIPR        FV4,FV0\n"
+        "          FSCHG\n"
+        "          FMOV.S      FR3,FR0\n"
+        "          RTS\n"
+        "          ADD         #16,R15\n",
+        // under 5.1 R13 -cpu=sh4 -optimize=1 -speed -fpu=single,
+        // void c_blend2(float *a, float *b, float *c, float *w, float *o)
+        // { o[0] = _builtin_fipr(w, a); o[1] = _builtin_fipr(w, b);
+        // o[2] = _builtin_fipr(w, c); }: the vector three products share is
+        // loaded for each
+        "_c_blend2:\n"
+        "          MOV.L       R13,@-R15\n"
+        "          ADD         #-12,R15\n"
+        "          MOV         R7,R3\n"
+        "          MOV         R7,R13\n"
+        "          MOV         #4,R0\n"
+        "          MOV.L       R4,@(8,R15)\n"
+        "          MOV.L       R5,@(4,R15)\n"
+        "          MOV.L       R6,@R15\n"
+        "          MOV.L       @(8,R15),R2\n"
+        "          FMOV.S      @R3+,FR0\n"
+        "          FMOV.S      @R2+,FR4\n"
+        "          FMOV.S      @R3+,FR1\n"
+        "          FMOV.S      @R2+,FR5\n"
+        "          FMOV.S      @R3+,FR2\n"
+        "          FMOV.S      @R2+,FR6\n"
+        "          FMOV.S      @R3+,FR3\n"
+        "          MOV         R13,R3\n"
+        "          FMOV.S      @R2+,FR7\n"
+        "          MOV.L       @(16,R15),R1\n"
+        "          FIPR        FV4,FV0\n"
+        "          FMOV.S      FR3,@R1\n"
+        "          MOV.L       @(4,R15),R2\n"
+        "          FMOV.S      @R3+,FR0\n"
+        "          FMOV.S      @R2+,FR4\n"
+        "          FMOV.S      @R3+,FR1\n"
+        "          FMOV.S      @R2+,FR5\n"
+        "          FMOV.S      @R3+,FR2\n"
+        "          FMOV.S      @R2+,FR6\n"
+        "          FMOV.S      @R3+,FR3\n"
+        "          FMOV.S      @R2+,FR7\n"
+        "          FIPR        FV4,FV0\n"
+        "          FMOV.S      FR3,@(R0,R1)\n"
+        "          MOV.L       @R15,R3\n"
+        "          FMOV.S      @R3+,FR4\n"
+        "          FMOV.S      @R13+,FR0\n"
+        "          MOV         #8,R0\n"
+        "          FMOV.S      @R3+,FR5\n"
+        "          FMOV.S      @R13+,FR1\n"
+        "          FMOV.S      @R3+,FR6\n"
+        "          FMOV.S      @R13+,FR2\n"
+        "          FMOV.S      @R3+,FR7\n"
+        "          FMOV.S      @R13+,FR3\n"
+        "          FIPR        FV4,FV0\n"
+        "          FMOV.S      FR3,@(R0,R1)\n"
+        "          ADD         #12,R15\n"
+        "          RTS\n"
+        "          MOV.L       @R15+,R13\n",
+    };
+    for (size_t i = 0; i < sizeof compiled / sizeof compiled[0]; i++) {
+        CHECK(inspects(compiled[i], UNKNOWN, "none"));
+    }
+
+    // inline text, which SHC copies as written, holds the witness: 1.20J
+    // ninja.lib's cubic_blend, a #pragma inline_asm body that keeps its
+    // weights in FV4 across three FIPRs, here below a caller that loads them
+    // once
+    static const char member[] = F(
+        S("FMOV.S      @R0+,FR4") S("FMOV.S      @R0+,FR5")
+            S("FMOV.S      @R0+,FR6")
+                S("FMOV.S      @R0+,FR7") "    MOV.L       @R15,R1\n"
+                                          "    FMOV.S      @R4+,FR0\n"
+                                          "    FMOV.S      @R5+,FR1\n"
+                                          "    FMOV.S      @R6+,FR2\n"
+                                          "    FMOV.S      @R7+,FR3\n"
+                                          "    FIPR        FV4,FV0\n"
+                                          "    FMOV.S      FR3,FR8\n"
+                                          "    FMOV.S      @R4+,FR0\n"
+                                          "    FMOV.S      @R5+,FR1\n"
+                                          "    FMOV.S      @R6+,FR2\n"
+                                          "    FMOV.S      @R7+,FR3\n"
+                                          "    FIPR        FV4,FV0\n"
+                                          "    FMOV.S      FR3,FR9\n"
+                                          "    FMOV.S      @R4,FR0\n"
+                                          "    FMOV.S      @R5,FR1\n"
+                                          "    FMOV.S      @R6,FR2\n"
+                                          "    FMOV.S      @R7,FR3\n"
+                                          "    FIPR        FV4,FV0\n"
+                                          "    ADD         #12,R1\n"
+                                          "    FMOV.S      FR3,@-R1\n"
+                                          "    FMOV.S      FR9,@-R1\n"
+                                          "    FMOV.S      FR8,@-R1\n" ALIGN S(
+                                              "RTS") S("NOP"));
+    CHECK(inspects_all(member, UNKNOWN,
+                       "operand fipr-shared 17 FR4 FR5 FR6 FR7, operand "
+                       "fipr-shared 23 FR4 FR5 FR6 FR7; assembler-layout 28"));
+
+    // and so does a routine the inter-module optimizer made: under 5.1 R13
+    // with -goptimize, optlnksh -optimize=same_code -samesize=8 moves a
+    // block that holds a shared FIPR and a whole template, three times in
+    // one function, into _com_opt1, with two FIPRs and one load of each
+    // register
+    static const char routine[] = "_com_opt1:\n"
+                                  "          MOV         R14,R2\n"
+                                  "          MOV         R14,R3\n"
+                                  "          FIPR        FV4,FV0\n"
+                                  "          FMOV.S      @R2+,FR0\n"
+                                  "          FMOV.S      @R3+,FR4\n"
+                                  "          FMOV.S      @R2+,FR1\n"
+                                  "          FMOV.S      @R3+,FR5\n"
+                                  "          FMOV.S      @R2+,FR2\n"
+                                  "          FMOV.S      @R3+,FR6\n"
+                                  "          FMOV.S      FR3,FR14\n"
+                                  "          FMOV.S      @R2+,FR3\n"
+                                  "          FMOV.S      @R3+,FR7\n"
+                                  "          FIPR        FV4,FV0\n"
+                                  "          FMOV.S      FR3,FR0\n"
+                                  "          RTS\n"
+                                  "          NOP\n";
+    CHECK(inspects(routine, UNKNOWN,
+                   "operand fipr-shared 14 FR0 FR1 FR2 FR3 FR4 FR5 FR6 FR7"));
 }
 
 static void test_inspect_operands(void)
@@ -3857,6 +4763,340 @@ static void test_inspect_labels(void)
     }
 }
 
+static void test_inspect_slot(void)
+{
+    // an FSCHG in a delayed branch's slot, a witness at its line: below RTS,
+    // RTE, BRA, BRAF, JMP, BSR, BSRF, JSR, BT/S and BF/S, in any case, past
+    // lines control passes, with a label of its own, and where control never
+    // goes
+    static const struct {
+        const char *in;
+        const char *want;
+    } slots[] = {
+        {F(S("FSCHG") S("FMOV        @R5+,DR0") S("FMOV        DR0,@R4")
+               S("RTS") S("FSCHG")),
+         "operand fschg-slot 6"},
+        {F(S("FSCHG") S("RTE") S("FSCHG")), "operand fschg-slot 4"},
+        {F(S("FSCHG") S("BRA         L1") S("FSCHG") "L1:\n" S("RTS") S("NOP")),
+         "operand fschg-slot 4"},
+        {F(S("FSCHG") S("BRAF        R1") S("FSCHG")),
+         "operand fschg-slot 4; opaque-transfer 3"},
+        {F(S("FSCHG") S("JMP         @R1") S("FSCHG")),
+         "operand fschg-slot 4; opaque-transfer 3"},
+        {F(S("FSCHG") S("BSR         _g") S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-slot 4; call 3"},
+        {F(S("FSCHG") S("BSRF        R1") S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-slot 4; call 3"},
+        {F(S("FSCHG") S("JSR         @R1") S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-slot 4; call 3"},
+        {F(S("FSCHG") S("BT/S        L1") S("FSCHG") "L1:\n" S("RTS") S("NOP")),
+         "operand fschg-slot 4"},
+        {F(S("FSCHG") S("BF/S        L1") S("FSCHG") "L1:\n" S("RTS") S("NOP")),
+         "operand fschg-slot 4"},
+        {F(S("fschg") S("rts") S("fschg")), "operand fschg-slot 4"},
+        {F(S("RTS") "\n"
+                    "; a comment\n"
+                    "L1:\n" S(".IMPORT     _g")
+                        S(".EXPORT     _f,") "+           _h\n" S("FSCHG")),
+         "operand fschg-slot 9"},
+        {F(S("RTS") "L1:       FSCHG\n"), "operand fschg-slot 3"},
+        {F(S("RTS") S("NOP") S("RTS") S("FSCHG")), "operand fschg-slot 5"},
+    };
+    for (size_t i = 0; i < sizeof slots / sizeof slots[0]; i++) {
+        CHECK(inspects(slots[i].in, UNKNOWN, slots[i].want));
+        CHECK(inspects(slots[i].in, SHCKIT_SZ_1, slots[i].want));
+    }
+
+    // each FSCHG in a slot, in line order, and after a pair's move above it;
+    // and an opcode outranks it
+    CHECK(inspects_all(
+        F(S("BT          L1") S("RTS") S("FSCHG") "L1:\n" S("RTS") S("FSCHG")),
+        UNKNOWN, "operand fschg-slot 4, operand fschg-slot 7"));
+    CHECK(inspects_all(
+        F(S("FSCHG") S("FMOV        DR12,@-R4") S("RTS") S("FSCHG")), UNKNOWN,
+        "operand fschg-pairs 3, operand fschg-slot 5"));
+    CHECK(INSPECTS(S("RTS") S("FSCHG") S("SETT"), "opcode sett 4"));
+
+    // no witness: an FSCHG above the branch, where R10 closes a run; below
+    // BT or BF, which have no slot; below a slot; at a branch's target; an
+    // FRCHG in a slot; and an FSCHG below a line that is no instruction and
+    // that control doesn't pass, past which the rule places no slot. asmsh
+    // assembles the FSCHG into the slot past this .POOL, which has no
+    // literal waiting, and past this .SECTION, which resumes P
+    static const struct {
+        const char *in;
+        const char *want;
+    } others[] = {
+        {F(S("FSCHG") S("FMOV        @R5+,DR0") S("FMOV        DR0,@R4")
+               S("FSCHG") S("RTS") S("NOP")),
+         "none"},
+        {F(S("TST         R5,R5") S("BT          L1") S("FSCHG")
+               S("FMOV        @R4+,XD0") S("FSCHG") "L1:\n" S("RTS") S("NOP")),
+         "none"},
+        {F(S("TST         R5,R5") S("BF          L1") S("FSCHG")
+               S("FMOV        @R4+,XD0") S("FSCHG") "L1:\n" S("RTS") S("NOP")),
+         "none"},
+        {F(S("RTS") S("NOP") S("FSCHG")), "none"},
+        {F(S("BRA         L1") S("NOP") "L1:\n" S("FSCHG") S("FSCHG") S("RTS")
+               S("NOP")),
+         "none"},
+        {F(S("RTS") S("FRCHG")), "none"},
+        {F(S("RTS") ALIGN S("FSCHG")), "none; delay-slot 2"},
+        {F(S("RTS") S(".POOL") S("FSCHG")), "none; delay-slot 2"},
+        {F(S("RTS") S(".NOPOOL") S("FSCHG")), "none; delay-slot 2"},
+        {F(S("RTS") CODE S("FSCHG")), "none; delay-slot 2"},
+    };
+    for (size_t i = 0; i < sizeof others / sizeof others[0]; i++) {
+        CHECK(inspects(others[i].in, UNKNOWN, others[i].want));
+        CHECK(inspects(others[i].in, SHCKIT_SZ_1, others[i].want));
+    }
+
+    // the branch and its slot are the function's: a function whose first
+    // line is the FSCHG takes no branch from the lines above it, and one
+    // whose last line is the branch takes no slot from the lines below
+    static const char bounds[] = F(S("RTS") S("FSCHG") S("RTS") S("NOP"));
+    CHECK(inspects_lines(bounds, 2, 0, UNKNOWN, "none"));
+    CHECK(inspects_lines(bounds, 1, 0, UNKNOWN, "operand fschg-slot 3"));
+    CHECK(inspects_lines(bounds, 0, 2, UNKNOWN, "none; delay-slot 2"));
+}
+
+static void test_inspect_slot_compiled(void)
+{
+    // what R10 writes for C under -cpu=sh4 -optimize=1 -speed, cut down,
+    // which the rule may not witness: it closes a run above the branch and
+    // leaves the slot to another instruction or a NOP. M is float[4][4].
+    static const struct {
+        const char *in;
+        const char *want;
+    } compiled[] = {
+        // void e_st(M m) { _builtin_st_ext(m); }
+        {"_e_st:\n"
+         "          ADD         #64,R4\n"
+         "          FSCHG\n"
+         "          FMOV        XD14,@-R4\n"
+         "          FMOV        XD0,@-R4\n"
+         "          FSCHG\n"
+         "          RTS\n"
+         "          NOP\n",
+         "none"},
+        // int r_st(M m, int x) { _builtin_st_ext(m); return x; }
+        {"_r_st:\n"
+         "          ADD         #64,R4\n"
+         "          FSCHG\n"
+         "          FMOV        XD14,@-R4\n"
+         "          FMOV        XD0,@-R4\n"
+         "          FSCHG\n"
+         "          RTS\n"
+         "          MOV         R5,R0\n",
+         "none"},
+        // float r_fl(M m, float x) { _builtin_ld_ext(m); return x; }
+        {"_r_fl:\n"
+         "          FSCHG\n"
+         "          FMOV        @R4+,XD0\n"
+         "          FMOV        @R4+,XD14\n"
+         "          FSCHG\n"
+         "          RTS\n"
+         "          FMOV.S      FR4,FR0\n",
+         "none"},
+        // void a1(M m, void (*f)(void)) { _builtin_st_ext(m); f(); }
+        {"_a1:\n"
+         "          ADD         #-4,R15\n"
+         "          ADD         #64,R4\n"
+         "          MOV.L       R5,@R15\n"
+         "          FSCHG\n"
+         "          FMOV        XD14,@-R4\n"
+         "          FMOV        XD0,@-R4\n"
+         "          FSCHG\n"
+         "          MOV.L       @R15,R3\n"
+         "          JMP         @R3\n"
+         "          ADD         #4,R15\n",
+         "none; opaque-transfer 10"},
+        // void a8(M m) { for (;;) { _builtin_ld_ext(m); } }
+        {"_a8:\n"
+         "L397:\n"
+         "          MOV         R4,R3\n"
+         "          FSCHG\n"
+         "          FMOV        @R3+,XD0\n"
+         "          FMOV        @R3+,XD14\n"
+         "          FSCHG\n"
+         "          BRA         L397\n"
+         "          NOP\n",
+         "none"},
+        // void a10(M m, int n)
+        // { do { _builtin_ld_ext(m); m = *gpm; } while (--n); }, whose
+        // branch goes to an FSCHG and whose slot takes the load below it
+        {"_a10:\n"
+         "          MOV.L       L439+4,R6\n"
+         "L400:\n"
+         "          FSCHG\n"
+         "          FMOV        @R4+,XD0\n"
+         "          FMOV        @R4+,XD14\n"
+         "          FSCHG\n"
+         "          DT          R5\n"
+         "          BF/S        L400\n"
+         "          MOV.L       @R6,R4\n"
+         "          RTS\n"
+         "          NOP\n"
+         "L439:\n"
+         "          .DATA.L     _gi\n"
+         "          .DATA.L     _gpm\n",
+         "none"},
+        // void a17(M m, int n)
+        // { if (n) { _builtin_ld_ext(m); return; } gi = 0; }, an FSCHG
+        // right below BT, which has no slot
+        {"_a17:\n"
+         "          TST         R5,R5\n"
+         "          BT          L413\n"
+         "          FSCHG\n"
+         "          FMOV        @R4+,XD0\n"
+         "          FMOV        @R4+,XD14\n"
+         "          FSCHG\n"
+         "          RTS\n"
+         "          NOP\n"
+         "L413:\n"
+         "          MOV.L       L439,R3\n"
+         "          MOV         #0,R2\n"
+         "          MOV.L       R2,@R3\n"
+         "          RTS\n"
+         "          NOP\n"
+         "L439:\n"
+         "          .DATA.L     _gi\n",
+         "none"},
+        // void b_if(M m, M n, int c)
+        // { if (c) _builtin_st_ext(m); else _builtin_st_ext(n); }, whose
+        // arms share the closing FSCHG: the first ends inside its run in
+        // BRA and a NOP
+        {"_b_if:\n"
+         "          TST         R6,R6\n"
+         "          BT          L555\n"
+         "          ADD         #64,R4\n"
+         "          FSCHG\n"
+         "          FMOV        XD14,@-R4\n"
+         "          FMOV        XD0,@-R4\n"
+         "          BRA         L593\n"
+         "          NOP\n"
+         "L555:\n"
+         "          ADD         #64,R5\n"
+         "          FSCHG\n"
+         "          FMOV        XD14,@-R5\n"
+         "          FMOV        XD0,@-R5\n"
+         "L593:\n"
+         "          FSCHG\n"
+         "          RTS\n"
+         "          NOP\n",
+         "none"},
+        // under -optimize=0 -extra=a=40, void b_if9(M a, M b, M c, int k)
+        // { if (k) _builtin_mtrx4muladd(a, b, c);
+        //   else _builtin_mtrx4mulsub(a, b, c); }, cut down to one run: the
+        // BRA over a pool takes into its slot, across the FSCHG, the FADD
+        // that SHCASM marked for a slot
+        {"_b_if9:\n"
+         "          ADD         #32,R2\n"
+         "          FSCHG\n"
+         "          FMOV        DR2,@-R2\n"
+         "          FMOV        DR0,@-R2\n"
+         "          FMOV        @R1+,DR0\n"
+         "          BRA         L573\n"
+         "          FADD        FR7,FR3\n"
+         "L573:\n"
+         "          FMOV        @R1+,DR2\n"
+         "          FMOV        @R3+,DR4\n"
+         "          FMOV        @R3+,DR6\n"
+         "          FSCHG\n"
+         "          FTRV        XMTRX,FV0\n"
+         "          RTS\n"
+         "          NOP\n",
+         "none"},
+    };
+    for (size_t i = 0; i < sizeof compiled / sizeof compiled[0]; i++) {
+        CHECK(inspects(compiled[i].in, UNKNOWN, compiled[i].want));
+        CHECK(inspects(compiled[i].in, SHCKIT_SZ_0, compiled[i].want));
+    }
+
+    // inline text that ends in a branch with no slot, above C that begins
+    // with a run: void w_slot(M m, int n) { if (n) back(); _builtin_ld_ext(m);
+    // }, back a #pragma inline_asm function of RTS, cut down. R10 writes
+    // .ALIGN 4 below the inline text, past which the rule places no slot, and
+    // reloads m before the run. So once drop-inline-align drops the line,
+    // the slot takes the load: the return below the entry stands on inline
+    // text, and an FSCHG in the slot would outrank it
+    static const char copied[] = CODE "_w_slot:\n"
+                                      "          ADD         #-4,R15\n"
+                                      "          TST         R5,R5\n"
+                                      "          BF/S        L268\n"
+                                      "          MOV.L       R4,@R15\n"
+                                      "          MOV.L       L269,R3\n"
+                                      "          JMP         @R3\n"
+                                      "          NOP\n"
+                                      "L268:\n"
+                                      "          BRA         L267\n"
+                                      "          NOP\n"
+                                      "L269:\n"
+                                      "          .DATA.L     L265\n"
+                                      "L267:\n"
+                                      "          RTS\n" ALIGN "L265:\n"
+                                      "          MOV.L       @R15,R3\n"
+                                      "          FSCHG\n"
+                                      "          FMOV        @R3+,XD0\n"
+                                      "          FMOV        @R3+,XD14\n"
+                                      "          FSCHG\n"
+                                      "          RTS\n"
+                                      "          ADD         #4,R15\n";
+    static const char dropped[] = CODE "_w_slot:\n"
+                                       "          ADD         #-4,R15\n"
+                                       "          TST         R5,R5\n"
+                                       "          BF/S        L268\n"
+                                       "          MOV.L       R4,@R15\n"
+                                       "          MOV.L       L269,R3\n"
+                                       "          JMP         @R3\n"
+                                       "          NOP\n"
+                                       "L268:\n"
+                                       "          BRA         L267\n"
+                                       "          NOP\n"
+                                       "L269:\n"
+                                       "          .DATA.L     L265\n"
+                                       "L267:\n"
+                                       "          RTS\n"
+                                       "L265:\n"
+                                       "          MOV.L       @R15,R3\n"
+                                       "          FSCHG\n"
+                                       "          FMOV        @R3+,XD0\n"
+                                       "          FMOV        @R3+,XD14\n"
+                                       "          FSCHG\n"
+                                       "          RTS\n"
+                                       "          ADD         #4,R15\n";
+    CHECK(rewrites(DROP, copied, dropped));
+    CHECK(inspects_lines(copied, 1, 0, UNKNOWN, "none; opaque-transfer 8"));
+    CHECK(inspects_lines(dropped, 1, 0, UNKNOWN,
+                         "abi return-below-entry 18 -4; opaque-transfer 8"));
+
+    // inline text that ends in a delayed branch, above C that begins with a
+    // run: void pc_slot(M m), whose body is a #pragma asm block of BRA
+    // PA_OUT, _builtin_ld_ext(m); and a block of PA_OUT:, cut down. R10
+    // reloads nothing below the block: its own FSCHG follows the .ALIGN 4,
+    // past which the rule places no slot. So once drop-inline-align drops
+    // the line, the FSCHG is a witness that stands on the inline BRA
+    static const char written[] =
+        CODE "_pc_slot:\n"
+             "          BRA         PA_OUT\n" ALIGN "          FSCHG\n"
+             "          FMOV        @R4+,XD0\n"
+             "          FMOV        @R4+,XD14\n"
+             "          FSCHG\n"
+             "L233:\n"
+             "PA_OUT:\n" ALIGN S("RTS") S("NOP");
+    static const char patched[] = CODE "_pc_slot:\n"
+                                       "          BRA         PA_OUT\n"
+                                       "          FSCHG\n"
+                                       "          FMOV        @R4+,XD0\n"
+                                       "          FMOV        @R4+,XD14\n"
+                                       "          FSCHG\n"
+                                       "L233:\n"
+                                       "PA_OUT:\n" S("RTS") S("NOP");
+    CHECK(rewrites(DROP, written, patched));
+    CHECK(inspects_lines(written, 1, 0, UNKNOWN, "none; delay-slot 3"));
+    CHECK(inspects_lines(patched, 1, 0, UNKNOWN, "operand fschg-slot 4"));
+}
+
 static void test_inspect_stack_written(void)
 {
     // a write to R15 other than a push's or pop's address, an ADD or SUB
@@ -4250,6 +5490,295 @@ static void test_inspect_fpscr_compiled(void)
                                S("MOV.L       @R15+,R0")
                                    S("LDS         R0,FPSCR") S("RTS") S("NOP"),
                    "none; call 7"));
+}
+
+// The rest of a function that saved PR for the call on one of its paths: the
+// call, the pop, and L1, where the other path joins.
+#define SAVED                                                                  \
+    S("JSR         @R5")                                                       \
+    S("NOP") S("LDS.L       @R15+,PR") "L1:\n" S("RTS") S("NOP")
+#define PUSH S("STS.L       PR,@-R15")
+
+static void test_inspect_pr_save(void)
+{
+    // PR's push through R15 below a conditional branch and its slot, in the
+    // branch's run, a witness at its line: below BT, BF, BT/S and BF/S, in
+    // any case, without a size, through SP, past other instructions, each
+    // kind of call among them, in a call's slot, past lines control passes,
+    // below a branch that holds a label, where control never goes, and in a
+    // later branch's slot
+    static const struct {
+        const char *in;
+        const char *want;
+    } saves[] = {
+        {F(S("TST         R4,R4") S("BT          L1") PUSH SAVED),
+         "abi pr-save-below-branch 4; call 5"},
+        {F(S("TST         R4,R4") S("BF          L1") PUSH SAVED),
+         "abi pr-save-below-branch 4; call 5"},
+        {F(S("BT/S        L1") S("MOV         R4,R0") PUSH SAVED),
+         "abi pr-save-below-branch 4; call 5"},
+        {F(S("BF/S        L1") S("FABS        FR4") PUSH SAVED),
+         "abi pr-save-below-branch 4; call 5"},
+        {F(S("bt/s        L1") S("nop") S("sts.l       pr,@-r15") SAVED),
+         "abi pr-save-below-branch 4; call 5"},
+        {F(S("BT          L1") S("STS         PR,@-SP") SAVED),
+         "abi pr-save-below-branch 3; call 4"},
+        {F(S("BT          L1") S("MOV         R4,R6") S("JSR         @R5")
+               S("MOV         R6,R4") PUSH SAVED),
+         "abi pr-save-below-branch 6; call 4"},
+        {F(S("BT          L1") S("BSR         L1") S("NOP") PUSH SAVED),
+         "abi pr-save-below-branch 5; call 3"},
+        {F(S("BT          L1") S("BSRF        R4") S("NOP") PUSH SAVED),
+         "abi pr-save-below-branch 5; call 3"},
+        {F(S("BT          L1") S("JSR         @R5")
+               PUSH S("LDS.L       @R15+,PR") "L1:\n" S("RTS") S("NOP")),
+         "abi pr-save-below-branch 4; call 3"},
+        {F(S("BT          L1") "\n"
+                               "; a comment\n" S(".IMPORT     _g")
+                                   S(".EXPORT     _f,") "+           _h\n" PUSH
+                                       SAVED),
+         "abi pr-save-below-branch 8; call 9"},
+        {F(S("TST         R4,R4") "L2:       BT          L1\n" PUSH SAVED),
+         "abi pr-save-below-branch 4; call 5"},
+        {F(S("RTS") S("NOP") S("BT          L1") PUSH SAVED),
+         "abi pr-save-below-branch 5"},
+        {F(S("BT          L1") S("BT/S        L1") PUSH SAVED),
+         "abi pr-save-below-branch 4; call 5"},
+    };
+    for (size_t i = 0; i < sizeof saves / sizeof saves[0]; i++) {
+        CHECK(inspects(saves[i].in, UNKNOWN, saves[i].want));
+        CHECK(inspects(saves[i].in, SHCKIT_SZ_1, saves[i].want));
+    }
+
+    // each push of a run, in line order, and the stack rule's witness after
+    // them; an opcode outranks it; and an instruction with a continuation
+    // between the branch and the push leaves the witness standing
+    static const char freed[] = F(S("BT          L1") PUSH S(
+        "ADD         #4,R15") "L1:\n" S("RTS") S("ADD         #8,R15"));
+    CHECK(inspects_all(F(S("BT          L1") PUSH PUSH SAVED), UNKNOWN,
+                       "abi pr-save-below-branch 3, abi pr-save-below-branch "
+                       "4; call 5"));
+    CHECK(inspects_all(freed, UNKNOWN,
+                       "abi pr-save-below-branch 3, abi return-above-entry 7 "
+                       "+8"));
+    CHECK(INSPECTS(S("BT          L1") PUSH S("SETT") SAVED,
+                   "opcode sett 4; call 5"));
+    CHECK(INSPECTS(S("BT          L1")
+                       S("MOV.L       R4,") "+           @R6\n" PUSH SAVED,
+                   "abi pr-save-below-branch 5; continued 3"));
+
+    // no witness: the push above the branch, as SHC writes an entry; in the
+    // branch's own slot, past lines control passes too; below BRA, a call, a
+    // jump or a return with no conditional branch above; and with a
+    // continuation, which the rule can't read
+    static const struct {
+        const char *in;
+        const char *want;
+    } others[] = {
+        {F(PUSH S("TST         R4,R4") S("BT          L1") S("JSR         @R5")
+               S("NOP") "L1:\n" S("LDS.L       @R15+,PR") S("RTS") S("NOP")),
+         "none; call 5"},
+        {F(S("TST         R4,R4") S("BT/S        L1") PUSH S("JSR         @R5")
+               S("NOP") "L1:\n" S("LDS.L       @R15+,PR") S("RTS") S("NOP")),
+         "none; call 5"},
+        {F(S("BT/S        L1") "; a comment\n" S(".EXPORT     _f") PUSH S(
+             "JSR         @R5") S("NOP") "L1:\n" S("LDS.L       @R15+,PR")
+               S("RTS") S("NOP")),
+         "none; call 6"},
+        {F(S("BRA         L1") S("NOP") PUSH SAVED), "none"},
+        {F(S("JSR         @R5") S("NOP") PUSH SAVED), "none; call 2"},
+        {F(S("JMP         @R5") S("NOP") PUSH SAVED),
+         "none; opaque-transfer 2"},
+        {F(S("RTS") S("NOP") PUSH SAVED), "none"},
+        {F(S("BT          L1")
+               S("STS.L       PR,") "+           @-R15\n" SAVED),
+         "none; continued 3"},
+
+        // a label between the branch and the push: on a line of its own, on
+        // an instruction, on the push, and on a line control passes, as on
+        // every .EQU and .ASSIGN
+        {F(S("BT          L1") "L2:\n" PUSH SAVED), "none; call 5"},
+        {F(S("BT          L1") "L2:       MOV         R4,R6\n" PUSH SAVED),
+         "none; call 5"},
+        {F(S("BT          L1") "L2:       STS.L       PR,@-R15\n" SAVED),
+         "none; call 4"},
+        {F(S("BT/S        L1") "L2:       MOV         R4,R6\n" PUSH SAVED),
+         "none; call 5"},
+        {F(S("BT          L1") "L2:       .EXPORT     _f\n" PUSH SAVED),
+         "none; call 5"},
+        {F(S("BT          L1") "X:        .EQU        4\n" PUSH SAVED),
+         "none; call 5"},
+        {F(S("BT          L1") "X:        .ASSIGN     4\n" PUSH SAVED),
+         "none; call 5"},
+
+        // BRA, BRAF, JMP, RTS, RTE or TRAPA between them
+        {F(S("BT          L1") S("BRA         L1") S("NOP") PUSH SAVED),
+         "none"},
+        {F(S("BT          L1") S("BRAF        R1") S("NOP") PUSH SAVED),
+         "none; opaque-transfer 3"},
+        {F(S("BT          L1") S("JMP         @R1") S("NOP") PUSH SAVED),
+         "none; opaque-transfer 3"},
+        {F(S("BT          L1") S("RTS") S("NOP") PUSH SAVED), "none"},
+        {F(S("BT          L1") S("RTE") S("NOP") PUSH SAVED), "none"},
+        {F(S("BT          L1") S("TRAPA       #3") PUSH SAVED),
+         "none; opaque-transfer 3"},
+
+        // a directive between them other than .EXPORT and .IMPORT, a
+        // .SECTION that stays in the section among them
+        {F(S("BT          L1") ALIGN PUSH SAVED), "none; assembler-layout 3"},
+        {F(S("BT          L1") S(".POOL") PUSH SAVED),
+         "none; assembler-layout 3"},
+        {F(S("BT          L1") S(".NOPOOL") PUSH SAVED),
+         "none; assembler-layout 3"},
+        {F(S("BT          L1") CODE PUSH SAVED), "none; section-change 2"},
+
+        // PR saved another way, its pop, and another register's push
+        {F(S("BT          L1") S("STS         PR,R1") S("MOV.L       R1,@-R15")
+               S("JSR         @R5") S("NOP") S("MOV.L       @R15+,R1")
+                   S("LDS         R1,PR") "L1:\n" S("RTS") S("NOP")),
+         "none; call 5"},
+        {F(S("BT          L1") S("STS.L       PR,@-R4") S("JSR         @R5")
+               S("NOP") S("LDS.L       @R4+,PR") "L1:\n" S("RTS") S("NOP")),
+         "none; call 4"},
+        {F(PUSH S("BT          L1") S("LDS.L       @R15+,PR") S("RTS")
+               S("NOP") "L1:\n" S("LDS.L       @R15+,PR") S("RTS") S("NOP")),
+         "none"},
+        {F(S("BT          L1") S("STS.L       MACL,@-R15")
+               S("LDS.L       @R15+,MACL") "L1:\n" S("RTS") S("NOP")),
+         "none"},
+    };
+    for (size_t i = 0; i < sizeof others / sizeof others[0]; i++) {
+        CHECK(inspects(others[i].in, UNKNOWN, others[i].want));
+        CHECK(inspects(others[i].in, SHCKIT_SZ_1, others[i].want));
+    }
+
+    // the branch is one of the function's: a function whose first line is
+    // the push takes no branch from the lines above it, and one whose first
+    // line is the branch takes it
+    static const char bounds[] = F(S("BT          L1") PUSH SAVED);
+    CHECK(inspects_lines(bounds, 2, 0, UNKNOWN, "none; call 4"));
+    CHECK(inspects_lines(bounds, 1, 0, UNKNOWN,
+                         "abi pr-save-below-branch 3; call 4"));
+}
+
+static void test_inspect_pr_save_compiled(void)
+{
+    // what SHC writes for C, cut down, which the rule may not witness. A
+    // function's own push stands above its first branch. Under 5.1 R11,
+    // int early(int a) { if (a == 0) return 0; return g(a) + 1; }, whose
+    // path that returns before the call saves PR too
+    static const char early[] =
+        F(PUSH S("TST         R4,R4") S("BF          L246")
+              S("LDS.L       @R15+,PR") S("RTS")
+                  S("MOV         #0,R0") "L246:\n" S("MOV.L       L250,R2")
+                      S("JSR         @R2") S("NOP") S("ADD         #1,R0")
+                          S("LDS.L       @R15+,PR") S("RTS")
+                              S("NOP") "L250:\n" S(".DATA.L     _g"));
+    // under 5.0 R10, int tail(int a) { if (a == 0) return g(1) + 2;
+    // return g(a); }, whose push the scheduler moves inside its window,
+    // above the branch that ends it
+    static const char tail[] =
+        F(S("TST         R4,R4") PUSH S("BF          L246")
+              S("MOV.L       L248,R2") S("JSR         @R2")
+                  S("MOV         #1,R4") S("LDS.L       @R15+,PR") S("RTS")
+                      S("ADD         #2,R0") "L246:\n" S("MOV.L       L248,R3")
+                          S("JMP         @R3")
+                              S("LDS.L       @R15+,PR") "L248:\n" S(
+                                  ".DATA.L     _g"));
+    // and under 5.1 R11, a C draft of njRoundOff: float njRoundOff(float n)
+    // { if (!(n < 0.0f)) { n = _builtin_fabsf(n); return floorf(n); }
+    // n = _builtin_fabsf(n); return -floorf(n); }
+    static const char draft[] =
+        F(S("FLDI0       FR3") S("FCMP/GT     FR4,FR3") PUSH S(
+            "BT          L244") S("MOV.L       L250,R2") S("FABS        FR4")
+              S("JMP         @R2") S("LDS.L       @R15+,PR") "L244:\n" S(
+                  "MOV.L       L250,R3") S("JSR         @R3")
+                  S("FABS        FR4") S("LDS.L       @R15+,PR") S("RTS")
+                      S("FNEG        FR0") "L250:\n" S(".DATA.L     _floorf"));
+    CHECK(inspects(early, UNKNOWN, "none; call 10"));
+    CHECK(inspects(tail, UNKNOWN, "none; call 6"));
+    CHECK(inspects(draft, UNKNOWN, "none; opaque-transfer 8"));
+
+    // a static function's push stands below a branch of the function above
+    // it, past the label that is all that marks it. Under 5.0 R10
+    // -optimize=1 -size, void out1(int a, int b, int c)
+    // { if (pause_word == 0) in1(a, b, c); } above the static in1, whose
+    // entry, L237, its branch goes to
+    static const char entered[] = F(
+        S("MOV.L       L401,R2") S("MOV.L       @R2,R3") S("TST         R3,R3")
+            S("BT          L237") S("RTS") S("NOP") "L237:\n" S(
+                "MOV.L       R14,@-R15") PUSH S("MOV.L       L401+4,R14")
+                S("JSR         @R14") S("NOP") S("LDS.L       @R15+,PR")
+                    S("RTS") S("MOV.L       @R15+,R14") "L401:\n" S(
+                        ".DATA.L     _pause_word") S(".DATA.L     _vi"));
+    // and under 5.1 R11 -optimize=1 -size -fpu=single, void f3(int a)
+    // { { int i; for (i = 4; i; i -= 2) ; } s3(a); } above the static s3,
+    // which it falls into below its own BF. No branch goes to L239
+    static const char fell[] =
+        F(S("BRA         L757") S("MOV         #4,R5") "L758:\n" S(
+            "ADD         #-2,R5") "L757:\n" S("TST         R5,R5")
+              S("BF          L758") "L239:\n" PUSH S("MOV.L       L909,R3")
+                  S("JSR         @R3") S("NOP") S("MOV.L       L909,R2") S(
+                      "JMP         @R2")
+                      S("LDS.L       @R15+,PR") "L909:\n" S(".DATA.L     _v"));
+    CHECK(inspects(entered, UNKNOWN, "none; call 12"));
+    CHECK(inspects(fell, UNKNOWN, "none; call 12"));
+
+    // a label is in the text, not in the code: f3 and s3, written without
+    // the label that marks s3, read as the witness
+    static const char unmarked[] =
+        F(S("BRA         L757") S("MOV         #4,R5") "L758:\n" S(
+            "ADD         #-2,R5") "L757:\n" S("TST         R5,R5")
+              S("BF          L758") PUSH S("MOV.L       L909,R3")
+                  S("JSR         @R3") S("NOP") S("MOV.L       L909,R2") S(
+                      "JMP         @R2")
+                      S("LDS.L       @R15+,PR") "L909:\n" S(".DATA.L     _v"));
+    CHECK(inspects(unmarked, UNKNOWN, "abi pr-save-below-branch 9; call 11"));
+
+    // inline text that holds a BT, above a C function's push. Under 5.1 R11,
+    // the end of int before(int a) { if (a) v(); return a; }, a #pragma asm
+    // block, and int after(int a) { vi(a); vi(a + 1); return a; }: SHC
+    // writes .ALIGN 4 below the block and starts after at its label
+    static const char block[] = F(
+        S("RTS") S("NOP") S("TST         R4,R4") S("BT          asm_skip")
+            S("ADD         #1,R4") "asm_skip:\n" ALIGN "_after:\n" S(
+                "MOV.L       R14,@-R15") PUSH S("JSR         @R5") S("NOP")
+                S("LDS.L       @R15+,PR") S("RTS") S("MOV.L       @R15+,R14"));
+    // and int z_user(int a) { int r = z_test(a); if (r) return g(a) + r;
+    // return ga; }, z_test a #pragma inline_asm body: the function's own
+    // push stands above the body, and the .ALIGN 4 below it stops the stack
+    // rule
+    static const char body[] = F(
+        S("MOV.L       R14,@-R15") PUSH S("TST         R4,R4")
+            S("BT          ?zero") S("MOV         #1,R0") S("BRA         ?done")
+                S("NOP") "?zero:\n" S("MOV         #0,R0") "?done:\n" ALIGN S(
+                    "MOV         R0,R14") S("TST         R14,R14")
+                    S("BT          L251") S("JSR         @R5")
+                        S("NOP") "L251:\n" S("LDS.L       @R15+,PR") S("RTS")
+                            S("MOV.L       @R15+,R14"));
+    CHECK(inspects(block, UNKNOWN, "none"));
+    CHECK(inspects(body, UNKNOWN, "none; assembler-layout 12"));
+
+    // the R11b njRoundOff_ as its #pragma inline_asm body builds, which SHC
+    // copies as written: the push below BF/S and its slot is a witness
+    static const char member[] = F("    MOV.L       ?callee,R0\n"
+                                   "    FLDI0       FR0\n"
+                                   "    FCMP/GT     FR4,FR0\n"
+                                   "    BF/S        ?positive\n"
+                                   "    FABS        FR4\n"
+                                   "    STS.L       PR,@-R15\n"
+                                   "    JSR         @R0\n"
+                                   "    NOP\n"
+                                   "    LDS.L       @R15+,PR\n"
+                                   "    RTS\n"
+                                   "    FNEG        FR0\n"
+                                   "    .DATA.W     H'0000\n"
+                                   "?callee:\n"
+                                   "    .DATA.L     _floorf\n"
+                                   "?positive:\n"
+                                   "    JMP         @R0\n"
+                                   "    NOP\n" ALIGN S("RTS") S("NOP"));
+    CHECK(inspects(member, UNKNOWN, "abi pr-save-below-branch 7; call 8"));
 }
 
 static void test_inspect_stack(void)
@@ -4693,8 +6222,8 @@ static void test_inspect_pairs(void)
     // an odd number of FSCHGs on every path from the entry, under R10 in both
     // modes and whatever --sz says: a run that stores DR12 and DR14 below an
     // aligned pointer and one that loads them back, each spelling, size and
-    // memory operand, FR8, FR10, DR8 and DR10, an FSCHG in a slot, an FMOV in
-    // one, a run whose closing FSCHG two paths share, and a loop
+    // memory operand, FR8, FR10, DR8 and DR10, an FMOV in a slot, a run whose
+    // closing FSCHG two paths share, and a loop
     static const struct {
         const char *in;
         const char *want;
@@ -4734,9 +6263,6 @@ static void test_inspect_pairs(void)
          "operand fschg-pairs 3"},
         {F(S("FSCHG") S("FMOV        DR10,@R4") S("FSCHG") S("RTS") S("NOP")),
          "operand fschg-pairs 3"},
-        {F(S("TST         R4,R4") S("BT/S        L1") S("FSCHG")
-               S("NOP") "L1:\n" S("FMOV        DR12,@-R4") S("RTS") S("FSCHG")),
-         "operand fschg-pairs 7"},
         {F(S("FSCHG") S("RTS") S("FMOV        DR12,@-R4")),
          "operand fschg-pairs 4"},
         {F(S("TST         R4,R4") S("BT          L1") S("FSCHG") S(
@@ -4753,6 +6279,16 @@ static void test_inspect_pairs(void)
         for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
             CHECK(inspects(pairs[i].in, szs[j], pairs[i].want));
         }
+    }
+
+    // an FSCHG in a slot counts too, and is fschg-slot's witness there
+    static const char slotted[] =
+        F(S("TST         R4,R4") S("BT/S        L1") S("FSCHG")
+              S("NOP") "L1:\n" S("FMOV        DR12,@-R4") S("RTS") S("FSCHG"));
+    for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
+        CHECK(inspects_all(slotted, szs[j],
+                           "operand fschg-slot 4, operand fschg-pairs 7, "
+                           "operand fschg-slot 9"));
     }
 
     // pairs pushed and popped through R15, which comes back to its entry
@@ -4774,10 +6310,9 @@ static void test_inspect_pairs(void)
     CHECK(inspects_all(flipped, UNKNOWN,
                        "operand fschg-pairs 5; stack-unknown 5"));
 
-    // no witness: an even count, XD8 to XD14, moves between registers, a
-    // join whose paths disagree, a write to FPSCR, before an FSCHG too, and
-    // an interrupt function's pop of FPSCR, a line control never reaches and
-    // one past a call
+    // no witness: an even count, XD8 to XD14, a join whose paths disagree, a
+    // write to FPSCR, before an FSCHG too, and an interrupt function's pop
+    // of FPSCR, a line control never reaches and one past a call
     static const struct {
         const char *in;
         const char *want;
@@ -4788,32 +6323,39 @@ static void test_inspect_pairs(void)
                S("FMOV        XD12,@-R4") S("FMOV        XD14,@-R4") S("FSCHG")
                    S("RTS") S("NOP")),
          "none"},
-        {F(S("FSCHG") S("FMOV        DR12,DR2") S("FMOV        XD2,DR14")
-               S("FSCHG") S("RTS") S("NOP")),
-         "none"},
         {F(S("TST         R5,R5") S("BT          L1")
                S("FSCHG") "L1:\n" S("FMOV        DR12,@-R4") S("RTS") S("NOP")),
          "none"},
         {F(S("FSCHG") S("LDS         R4,FPSCR") S("FMOV        DR12,@-R4")
-               S("RTS") S("FSCHG")),
+               S("FSCHG") S("RTS") S("NOP")),
          "none"},
         {F(S("LDS         R4,FPSCR") S("FSCHG") S("FMOV        DR12,@-R4")
-               S("RTS") S("FSCHG")),
+               S("FSCHG") S("RTS") S("NOP")),
          "none"},
         {F(S("FSCHG") S("STS.L       FPSCR,@-R15") S("LDS.L       @R15+,FPSCR")
-               S("FMOV        DR12,@-R4") S("RTE") S("FSCHG")),
+               S("FMOV        DR12,@-R4") S("FSCHG") S("RTE") S("NOP")),
          "none"},
-        {F(S("FSCHG") S("RTS") S("NOP") S("FMOV        @R15+,DR12") S("RTS")
-               S("FSCHG")),
+        {F(S("FSCHG") S("RTS") S("NOP") S("FMOV        @R15+,DR12") S("FSCHG")
+               S("RTS") S("NOP")),
          "none"},
         {F(S("FSCHG") S("JSR         @R5") S("NOP") S("FMOV        DR12,@-R4")
-               S("RTS") S("FSCHG")),
+               S("FSCHG") S("RTS") S("NOP")),
          "none; call 3"},
     };
     for (size_t i = 0; i < sizeof singles / sizeof singles[0]; i++) {
         for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
             CHECK(inspects(singles[i].in, szs[j], singles[i].want));
         }
+    }
+
+    // a move of DR12 or DR14 between registers is fschg-register-moves'
+    // witness, not this rule's
+    static const char moved[] = F(S("FSCHG") S("FMOV        DR12,DR2") S(
+        "FMOV        XD2,DR14") S("FSCHG") S("RTS") S("NOP"));
+    for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
+        CHECK(inspects_all(moved, szs[j],
+                           "operand fschg-register-moves 3, operand "
+                           "fschg-register-moves 4"));
     }
 
     // what R10 writes for C, under an SDK build's flags but the last's,
@@ -5079,6 +6621,809 @@ static void test_inspect_pairs(void)
             CHECK(inspects(compiled[i], szs[j], "none"));
         }
     }
+}
+
+static void test_inspect_dt(void)
+{
+    // a DT after an odd number of FSCHGs on every path from the entry,
+    // whatever --sz says: in a loop that copies pairs, in any case, of any
+    // register, in a slot, past an FSCHG in a slot, and where every path
+    // into a loop has run one FSCHG
+    static const struct {
+        const char *in;
+        const char *want;
+    } counts[] = {
+        {F(S("FSCHG") "L1:\n" S("FMOV        @R5+,DR0") S("DT          R6")
+               S("FMOV        DR0,@R4") S("BF/S        L1")
+                   S("ADD         #8,R4") S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-dt 5"},
+        {F(S("fschg") S("dt          r6") S("fschg") S("rts") S("nop")),
+         "operand fschg-dt 3"},
+        {F(S("FSCHG") S("DT          R15") S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-dt 3; stack-unknown 3"},
+        {F(S("FSCHG") S("RTS") S("DT          R6")), "operand fschg-dt 4"},
+        {F(S("FSCHG") "L1:\n" S("DT          R6") S("BF          L1") S("FSCHG")
+               S("RTS") S("NOP")),
+         "operand fschg-dt 4"},
+        {F(S("TST         R4,R4") S("BT          L1") S("FSCHG")
+               S("BRA         L2") S("NOP") "L1:\n" S("FSCHG") "L2:\n" S(
+                   "DT          R6") S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-dt 10"},
+    };
+    static const int szs[] = {UNKNOWN, SHCKIT_SZ_0, SHCKIT_SZ_1};
+    for (size_t i = 0; i < sizeof counts / sizeof counts[0]; i++) {
+        for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
+            CHECK(inspects(counts[i].in, szs[j], counts[i].want));
+        }
+    }
+
+    // each DT so, in line order, among the other rules' witnesses: an FSCHG
+    // in a slot counts, and R15 written by a DT is stack-written's too
+    static const char each[] =
+        F(S("TST         R4,R4") S("BT/S        L1") S("FSCHG")
+              S("NOP") "L1:\n" S("DT          R6") S("DT          R15") S("RTS")
+                  S("FSCHG"));
+    CHECK(inspects_all(each, UNKNOWN,
+                       "operand fschg-slot 4, operand fschg-dt 7, operand "
+                       "fschg-dt 8, abi stack-written 8, operand fschg-slot "
+                       "10; stack-unknown 8"));
+
+    // no witness: an even count, as R10 counts a loop down below the run it
+    // closes, and no FSCHG at all; a join whose paths disagree; a write to
+    // FPSCR; a line control never reaches; one past a call; and one past an
+    // .ALIGN, where the FSCHG in the slot still shows
+    static const struct {
+        const char *in;
+        const char *want;
+    } others[] = {
+        {F("L1:\n" S("FSCHG") S("FMOV        @R4+,XD0") S("FSCHG")
+               S("DT          R5") S("BF          L1") S("RTS") S("NOP")),
+         "none"},
+        {F("L1:\n" S("DT          R5") S("BF          L1") S("RTS") S("NOP")),
+         "none"},
+        {F(S("TST         R4,R4") S("BT          L1")
+               S("FSCHG") "L1:\n" S("DT          R6") S("RTS") S("NOP")),
+         "none"},
+        {F(S("FSCHG") S("LDS         R4,FPSCR") S("DT          R6") S("FSCHG")
+               S("RTS") S("NOP")),
+         "none"},
+        {F(S("FSCHG") S("RTS") S("NOP") S("DT          R6") S("FSCHG") S("RTS")
+               S("NOP")),
+         "none"},
+        {F(S("FSCHG") S("JSR         @R5") S("NOP") S("DT          R6")
+               S("FSCHG") S("RTS") S("NOP")),
+         "none; call 3"},
+        {F(S("FSCHG") ALIGN "L1:\n" S("FMOV        @R5+,DR0")
+               S("DT          R6") S("FMOV        DR0,@R4") S("BF/S        L1")
+                   S("ADD         #8,R4") S("RTS") S("FSCHG")),
+         "operand fschg-slot 11; assembler-layout 3"},
+
+        // what else counts a loop or branches after an odd number: the rule
+        // reads the DT alone
+        {F(S("FSCHG") "L1:\n" S("ADD         #-1,R6") S("TST         R6,R6")
+               S("BF          L1") S("FSCHG") S("RTS") S("NOP")),
+         "none"},
+        {F(S("FSCHG") "L1:\n" S("ADD         #-1,R6") S("CMP/PL      R6")
+               S("BT/S        L1") S("NOP") S("FSCHG") S("RTS") S("NOP")),
+         "none"},
+        {F(S("FSCHG") S("CMP/EQ      #0,R0") S("BT          L1")
+               S("FMOV        @R4+,XD0") "L1:\n" S("FSCHG") S("RTS") S("NOP")),
+         "none"},
+    };
+    for (size_t i = 0; i < sizeof others / sizeof others[0]; i++) {
+        for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
+            CHECK(inspects(others[i].in, szs[j], others[i].want));
+        }
+    }
+}
+
+static void test_inspect_dt_compiled(void)
+{
+    // what R10 writes for C under -cpu=sh4 -optimize=1 -speed, cut down,
+    // which the rule may not witness: C's own count stands outside the
+    // builtins' runs. M is float[4][4].
+    static const struct {
+        const char *in;
+        const char *want;
+    } compiled[] = {
+        // void l_1(M *m, int n)
+        // { do { _builtin_st_ext(*m); m++; } while (--n); }, whose DT
+        // stands right below the closing FSCHG
+        {"_l_1:\n"
+         "L527:\n"
+         "          MOV         R4,R3\n"
+         "          ADD         #64,R3\n"
+         "          FSCHG\n"
+         "          FMOV        XD14,@-R3\n"
+         "          FMOV        XD0,@-R3\n"
+         "          FSCHG\n"
+         "          DT          R5\n"
+         "          BF/S        L527\n"
+         "          ADD         #64,R4\n"
+         "          RTS\n"
+         "          NOP\n",
+         "none"},
+        // void o_3(float *a, float **b, float *c, int n)
+        // { do { _builtin_ftrvadd(a, b[--n], c); } while (n); }, whose
+        // counter the second pointer's own expression steps: above the first
+        // FSCHG
+        {"_o_3:\n"
+         "          MOV.L       R14,@-R15\n"
+         "          ADD         #-12,R15\n"
+         "          MOV.L       R4,@R15\n"
+         "          MOV         R7,R14\n"
+         "          MOV.L       R5,@(4,R15)\n"
+         "          MOV.L       R6,@(8,R15)\n"
+         "L577:\n"
+         "          MOV.L       @(4,R15),R0\n"
+         "          ADD         #-1,R14\n"
+         "          MOV.L       @R15,R2\n"
+         "          MOV         R14,R3\n"
+         "          SHLL2       R3\n"
+         "          MOV.L       @(R0,R3),R3\n"
+         "          FSCHG\n"
+         "          FMOV        @R2+,DR0\n"
+         "          FMOV        @R2+,DR2\n"
+         "          FTRV        XMTRX,FV0\n"
+         "          FMOV        @R3+,DR4\n"
+         "          FMOV        @R3+,DR6\n"
+         "          FSCHG\n"
+         "          FADD        FR4,FR0\n"
+         "          MOV.L       @(8,R15),R1\n"
+         "          FADD        FR5,FR1\n"
+         "          FADD        FR6,FR2\n"
+         "          ADD         #16,R1\n"
+         "          FADD        FR7,FR3\n"
+         "          FSCHG\n"
+         "          FMOV        DR2,@-R1\n"
+         "          FMOV        DR0,@-R1\n"
+         "          FSCHG\n"
+         "          TST         R14,R14\n"
+         "          BF          L577\n"
+         "          ADD         #12,R15\n"
+         "          RTS\n"
+         "          MOV.L       @R15+,R14\n",
+         "none"},
+        // void h4(float *a, float *b, float *d, int c)
+        // { if (c) _builtin_add4(a, b, d); else _builtin_sub4(a, b, d); },
+        // whose arms begin alike inside a run: R10 lifts no common FSCHG
+        // above the branch, joins the tails, and leaves a BRA, its NOP and a
+        // label in a run
+        {"_h4:\n"
+         "          ADD         #-12,R15\n"
+         "          TST         R7,R7\n"
+         "          MOV.L       R4,@(8,R15)\n"
+         "          MOV.L       R5,@R15\n"
+         "          BT/S        L337\n"
+         "          MOV.L       R6,@(4,R15)\n"
+         "          MOV.L       @(8,R15),R2\n"
+         "          FSCHG\n"
+         "          FMOV        @R2+,DR0\n"
+         "          FMOV        @R2+,DR2\n"
+         "          MOV.L       @R15,R3\n"
+         "          FMOV        @R3+,DR4\n"
+         "          FMOV        @R3+,DR6\n"
+         "          FSCHG\n"
+         "          FADD        FR4,FR0\n"
+         "          FADD        FR5,FR1\n"
+         "          MOV.L       @(4,R15),R2\n"
+         "          FADD        FR6,FR2\n"
+         "          FADD        FR7,FR3\n"
+         "          ADD         #16,R2\n"
+         "          FSCHG\n"
+         "          FMOV        DR2,@-R2\n"
+         "          FMOV        DR0,@-R2\n"
+         "          BRA         L372\n"
+         "          NOP\n"
+         "L337:\n"
+         "          MOV.L       @(8,R15),R3\n"
+         "          FSCHG\n"
+         "          FMOV        @R3+,DR0\n"
+         "          FMOV        @R3+,DR2\n"
+         "          MOV.L       @R15,R1\n"
+         "          FMOV        @R1+,DR4\n"
+         "          FMOV        @R1+,DR6\n"
+         "          FSCHG\n"
+         "          FSUB        FR4,FR0\n"
+         "          MOV.L       @(4,R15),R3\n"
+         "          FSUB        FR5,FR1\n"
+         "          FSUB        FR6,FR2\n"
+         "          ADD         #16,R3\n"
+         "          FSUB        FR7,FR3\n"
+         "          FSCHG\n"
+         "          FMOV        DR2,@-R3\n"
+         "          FMOV        DR0,@-R3\n"
+         "L372:\n"
+         "          FSCHG\n"
+         "          RTS\n"
+         "          ADD         #12,R15\n",
+         "none"},
+        // void h19(float *a, float *c, int n)
+        // { do { _builtin_add4(a, (float *)(n - 1), c); n = n - 1; }
+        //   while (n); }, the counter as the second pointer: its step
+        // for the pointer stands above the first FSCHG, and the DT below
+        // the last
+        {"_h19:\n"
+         "          MOV.L       R13,@-R15\n"
+         "          ADD         #-8,R15\n"
+         "          MOV.L       R4,@R15\n"
+         "          MOV         R6,R13\n"
+         "          MOV.L       R5,@(4,R15)\n"
+         "L357:\n"
+         "          MOV         R13,R3\n"
+         "          MOV.L       @R15,R2\n"
+         "          ADD         #-1,R3\n"
+         "          FSCHG\n"
+         "          FMOV        @R2+,DR0\n"
+         "          FMOV        @R2+,DR2\n"
+         "          FMOV        @R3+,DR4\n"
+         "          FMOV        @R3+,DR6\n"
+         "          FSCHG\n"
+         "          FADD        FR4,FR0\n"
+         "          FADD        FR5,FR1\n"
+         "          MOV.L       @(4,R15),R1\n"
+         "          FADD        FR6,FR2\n"
+         "          FADD        FR7,FR3\n"
+         "          ADD         #16,R1\n"
+         "          FSCHG\n"
+         "          FMOV        DR2,@-R1\n"
+         "          FMOV        DR0,@-R1\n"
+         "          FSCHG\n"
+         "          DT          R13\n"
+         "          BF          L357\n"
+         "          ADD         #8,R15\n"
+         "          RTS\n"
+         "          MOV.L       @R15+,R13\n",
+         "none"},
+        // void tog3(float *d, float *s, int n) { _builtin_fschg();
+        //   do { *d++ = *s++; } while (--n); _builtin_fschg(); }:
+        // _builtin_fschg() is a call, and the loop holds no FSCHG
+        {"_tog3:\n"
+         "          MOV.L       L254+2,R3\n"
+         "          JSR         @R3\n"
+         "          NOP\n"
+         "L253:\n"
+         "          FMOV.S      @R5+,FR3\n"
+         "          DT          R6\n"
+         "          FMOV.S      FR3,@R4\n"
+         "          BF/S        L253\n"
+         "          ADD         #4,R4\n"
+         "          MOV.L       L254+2,R2\n"
+         "          JMP         @R2\n"
+         "          NOP\n"
+         "L254:\n"
+         "          .RES.W      1\n"
+         "          .DATA.L     __builtin_fschg\n",
+         "none; call 3"},
+    };
+    for (size_t i = 0; i < sizeof compiled / sizeof compiled[0]; i++) {
+        CHECK(inspects(compiled[i].in, UNKNOWN, compiled[i].want));
+        CHECK(inspects(compiled[i].in, SHCKIT_SZ_0, compiled[i].want));
+    }
+
+    // inline text in front of compiled C: void w_dt(float *d, float *s)
+    // { sz_on(); do { *d++ = *s++; } while (--gk); sz_off(); }, sz_on and
+    // sz_off #pragma inline_asm functions of one FSCHG and gk R14 by #pragma
+    // global_register. The DT is the compiler's own, written for C. R10
+    // writes .ALIGN 4 below each piece of inline text, which stops the
+    // count, and once drop-inline-align drops it the DT is a witness that
+    // stands on the inline FSCHG
+    static const char copied[] =
+        CODE "_w_dt:\n"
+             "          ADD         #-8,R15\n"
+             "          MOV.L       R4,@(4,R15)\n"
+             "          MOV.L       R5,@R15\n"
+             "          FSCHG\n" ALIGN "L263:\n"
+             "          MOV.L       @(4,R15),R2\n"
+             "          DT          R14\n"
+             "          ADD         #4,R2\n"
+             "          MOV.L       R2,@(4,R15)\n"
+             "          MOV.L       @R15,R3\n"
+             "          ADD         #4,R3\n"
+             "          MOV.L       R3,@R15\n"
+             "          ADD         #-4,R3\n"
+             "          FMOV.S      @R3,FR3\n"
+             "          BF/S        L263\n"
+             "          FMOV.S      FR3,@-R2\n"
+             "          BRA         L266\n"
+             "          NOP\n"
+             "L266:\n"
+             "          FSCHG\n" ALIGN S("RTS") S("ADD         #8,R15");
+    static const char dropped[] =
+        CODE "_w_dt:\n"
+             "          ADD         #-8,R15\n"
+             "          MOV.L       R4,@(4,R15)\n"
+             "          MOV.L       R5,@R15\n"
+             "          FSCHG\n"
+             "L263:\n"
+             "          MOV.L       @(4,R15),R2\n"
+             "          DT          R14\n"
+             "          ADD         #4,R2\n"
+             "          MOV.L       R2,@(4,R15)\n"
+             "          MOV.L       @R15,R3\n"
+             "          ADD         #4,R3\n"
+             "          MOV.L       R3,@R15\n"
+             "          ADD         #-4,R3\n"
+             "          FMOV.S      @R3,FR3\n"
+             "          BF/S        L263\n"
+             "          FMOV.S      FR3,@-R2\n"
+             "          BRA         L266\n"
+             "          NOP\n"
+             "L266:\n"
+             "          FSCHG\n" S("RTS") S("ADD         #8,R15");
+    CHECK(rewrites(DROP, copied, dropped));
+    CHECK(inspects_lines(copied, 1, 0, UNKNOWN, "none; assembler-layout 7"));
+    CHECK(inspects_lines(dropped, 1, 0, UNKNOWN, "operand fschg-dt 9"));
+}
+
+static void test_inspect_stores(void)
+{
+    // an FMOV to memory from FR4, FR6, DR4 or DR6 after an odd number of
+    // FSCHGs on every path from the entry, whatever --sz says: each
+    // spelling, size and memory operand, in any case, in a slot, and pushed
+    // through R15
+    static const struct {
+        const char *in;
+        const char *want;
+    } stores[] = {
+        {F(S("FLDI0       FR4") S("FLDI0       FR5") S("FSCHG")
+               S("FMOV        DR4,@-R1") S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-stores 5"},
+        {F(S("FSCHG") S("FMOV.S      FR4,@-R1") S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-stores 3"},
+        {F(S("FSCHG") S("FMOV        FR4,@R1") S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-stores 3"},
+        {F(S("FSCHG") S("FMOV.D      DR4,@(R0,R1)") S("FSCHG") S("RTS")
+               S("NOP")),
+         "operand fschg-stores 3"},
+        {F(S("FSCHG") S("FMOV        DR6,@-R4") S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-stores 3"},
+        {F(S("FSCHG") S("FMOV.S      FR6,@R5") S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-stores 3"},
+        {F(S("FSCHG") S("FMOV.S      FR6,@(R0,R4)") S("FSCHG") S("RTS")
+               S("NOP")),
+         "operand fschg-stores 3"},
+        {F(S("fschg") S("fmov        dr6,@-r4") S("fschg") S("rts") S("nop")),
+         "operand fschg-stores 3"},
+        {F(S("FSCHG") S("RTS") S("FMOV        DR4,@-R1")),
+         "operand fschg-stores 4"},
+        {F(S("FSCHG") S("FMOV        DR4,@-R15") S("FMOV        @R15+,DR4")
+               S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-stores 3"},
+    };
+    static const int szs[] = {UNKNOWN, SHCKIT_SZ_0, SHCKIT_SZ_1};
+    for (size_t i = 0; i < sizeof stores / sizeof stores[0]; i++) {
+        for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
+            CHECK(inspects(stores[i].in, szs[j], stores[i].want));
+        }
+    }
+
+    // each store so, in line order, among the other rules' witnesses:
+    // MPVABDEC_EraseBlock6 of the 1.20J sofdec.lib member mpvabdec, cut down,
+    // which clears a block from DR4 in a loop it counts down inside the run
+    // and closes in the slot of its RTS
+    static const char erase[] =
+        F(S("MOV         #6,R1") S("FLDI0       FR4") S("MOV         R1,R2")
+              S("SHLL8       R1") S("FLDI0       FR5") S("ADD         R4,R1")
+                  S("FSCHG") "?L3de:\n" S("FMOV        DR4,@-R1")
+                      S("DT          R2") S("FMOV        DR4,@-R1")
+                          S("BF/S        ?L3de") S("FMOV        DR4,@-R1")
+                              S("RTS") S("FSCHG"));
+    CHECK(inspects_all(erase, UNKNOWN,
+                       "operand fschg-stores 10, operand fschg-dt 11, operand "
+                       "fschg-stores 12, operand fschg-stores 14, operand "
+                       "fschg-slot 16"));
+
+    // no witness: C's own stores outside a run, at an even count; in a run,
+    // the loads of DR4 and DR6 and the stores of DR0, DR2 and the XD pairs
+    // that R10's templates write, XD4 and XD6 among them, whose fields are 5
+    // and 7 as FR5's and FR7's are; a join whose paths disagree; a write to
+    // FPSCR; a line control never reaches; and one past a call
+    static const struct {
+        const char *in;
+        const char *want;
+    } others[] = {
+        {F(S("FMOV.S      FR4,@-R5") S("FSCHG") S("FMOV        XD0,@-R4")
+               S("FSCHG") S("FMOV.S      FR6,@-R5") S("RTS") S("NOP")),
+         "none"},
+        {F(S("FSCHG") S("FMOV        @R2+,DR0") S("FMOV        @R2+,DR2")
+               S("FMOV        @R3+,DR4") S("FMOV        @R3+,DR6")
+                   S("FMOV.S      @R3,FR4") S("FMOV        @(R0,R3),DR6")
+                       S("FSCHG") S("RTS") S("NOP")),
+         "none"},
+        {F(S("FSCHG") S("FMOV        DR2,@-R1") S("FMOV        DR0,@-R1")
+               S("FMOV.S      FR2,@R1") S("FMOV        XD4,@-R1")
+                   S("FMOV        XD6,@-R1") S("FMOV.S      FR5,@-R1")
+                       S("FMOV.S      FR7,@-R1") S("FSCHG") S("RTS") S("NOP")),
+         "none"},
+        {F(S("TST         R5,R5") S("BT          L1")
+               S("FSCHG") "L1:\n" S("FMOV        DR4,@-R1") S("RTS") S("NOP")),
+         "none"},
+        {F(S("FSCHG") S("LDS         R4,FPSCR") S("FMOV        DR4,@-R1")
+               S("FSCHG") S("RTS") S("NOP")),
+         "none"},
+        {F(S("FSCHG") S("RTS") S("NOP") S("FMOV        DR4,@-R1") S("FSCHG")
+               S("RTS") S("NOP")),
+         "none"},
+        {F(S("FSCHG") S("JSR         @R5") S("NOP") S("FMOV        DR4,@-R1")
+               S("FSCHG") S("RTS") S("NOP")),
+         "none; call 3"},
+    };
+    for (size_t i = 0; i < sizeof others / sizeof others[0]; i++) {
+        for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
+            CHECK(inspects(others[i].in, szs[j], others[i].want));
+        }
+    }
+}
+
+static void test_inspect_stores_compiled(void)
+{
+    // what R10 writes for C under -cpu=sh4 -optimize=1 -speed, cut down,
+    // which the rule may not witness: C's own stores of FR4 to FR7 stand
+    // outside the builtins' runs. M is float[4][4].
+    static const struct {
+        const char *in;
+        const char *want;
+    } compiled[] = {
+        // void s_2(M m, float *p, float x, float y, float z, float w)
+        // { *--p = x; *--p = y; _builtin_st_ext(m); *--p = z; *--p = w; }
+        {"_s_2:\n"
+         "          ADD         #64,R4\n"
+         "          FMOV.S      FR4,@-R5\n"
+         "          FMOV.S      FR5,@-R5\n"
+         "          FSCHG\n"
+         "          FMOV        XD14,@-R4\n"
+         "          FMOV        XD6,@-R4\n"
+         "          FMOV        XD4,@-R4\n"
+         "          FMOV        XD0,@-R4\n"
+         "          FSCHG\n"
+         "          FMOV.S      FR6,@-R5\n"
+         "          RTS\n"
+         "          FMOV.S      FR7,@-R5\n",
+         "none"},
+        // void s1(float *a, float x, float *c) { _builtin_add4(a, &x, c); },
+        // a float's address as the second pointer: R10 keeps x in memory
+        // from the entry, so its store stands above the first FSCHG, and
+        // the run loads DR4 and DR6 through the pointer
+        {"_s1:\n"
+         "          ADD         #-12,R15\n"
+         "          MOV         R15,R3\n"
+         "          ADD         #8,R3\n"
+         "          FMOV.S      FR4,@R3\n"
+         "          MOV.L       R4,@R15\n"
+         "          MOV         R15,R3\n"
+         "          MOV.L       R5,@(4,R15)\n"
+         "          ADD         #8,R3\n"
+         "          MOV.L       @R15,R2\n"
+         "          FSCHG\n"
+         "          FMOV        @R2+,DR0\n"
+         "          FMOV        @R2+,DR2\n"
+         "          FMOV        @R3+,DR4\n"
+         "          FMOV        @R3+,DR6\n"
+         "          FSCHG\n"
+         "          FADD        FR4,FR0\n"
+         "          MOV.L       @(4,R15),R1\n"
+         "          FADD        FR5,FR1\n"
+         "          FADD        FR6,FR2\n"
+         "          ADD         #16,R1\n"
+         "          FADD        FR7,FR3\n"
+         "          FSCHG\n"
+         "          FMOV        DR2,@-R1\n"
+         "          FMOV        DR0,@-R1\n"
+         "          FSCHG\n"
+         "          RTS\n"
+         "          ADD         #12,R15\n",
+         "none"},
+        // void t3(float *a, float *b, float *c, float *d, float x)
+        // { _builtin_ftrvadd(a, (*d = x, b), c); }, a store in the second
+        // pointer's own expression: above the first FSCHG, and the run
+        // holds the pointer's load
+        {"_t3:\n"
+         "          ADD         #-20,R15\n"
+         "          MOV.L       R4,@R15\n"
+         "          MOV         #8,R0\n"
+         "          MOV.L       R5,@(4,R15)\n"
+         "          FMOV.S      FR4,FR3\n"
+         "          MOV.L       R6,@(16,R15)\n"
+         "          MOV.L       R7,@(12,R15)\n"
+         "          FMOV.S      FR4,@(R0,R15)\n"
+         "          MOV.L       @(12,R15),R3\n"
+         "          FMOV.S      FR3,@R3\n"
+         "          MOV.L       @R15,R3\n"
+         "          FSCHG\n"
+         "          FMOV        @R3+,DR0\n"
+         "          FMOV        @R3+,DR2\n"
+         "          FTRV        XMTRX,FV0\n"
+         "          MOV.L       @(4,R15),R2\n"
+         "          FMOV        @R2+,DR4\n"
+         "          FMOV        @R2+,DR6\n"
+         "          FSCHG\n"
+         "          FADD        FR4,FR0\n"
+         "          FADD        FR5,FR1\n"
+         "          MOV.L       @(16,R15),R3\n"
+         "          FADD        FR6,FR2\n"
+         "          FADD        FR7,FR3\n"
+         "          ADD         #16,R3\n"
+         "          FSCHG\n"
+         "          FMOV        DR2,@-R3\n"
+         "          FMOV        DR0,@-R3\n"
+         "          FSCHG\n"
+         "          RTS\n"
+         "          ADD         #20,R15\n",
+         "none"},
+        // void tog2(float *p, float x)
+        // { _builtin_fschg(); *--p = x; _builtin_fschg(); }:
+        // _builtin_fschg() is a call, and the store follows no FSCHG
+        {"_tog2:\n"
+         "          MOV.L       L254+2,R3\n"
+         "          JSR         @R3\n"
+         "          NOP\n"
+         "          MOV.L       L254+2,R2\n"
+         "          JMP         @R2\n"
+         "          FMOV.S      FR4,@-R4\n"
+         "L254:\n"
+         "          .RES.W      1\n"
+         "          .DATA.L     __builtin_fschg\n",
+         "none; call 3"},
+    };
+    for (size_t i = 0; i < sizeof compiled / sizeof compiled[0]; i++) {
+        CHECK(inspects(compiled[i].in, UNKNOWN, compiled[i].want));
+        CHECK(inspects(compiled[i].in, SHCKIT_SZ_0, compiled[i].want));
+    }
+
+    // inline text in front of compiled C: void pb_store(float *d, float a,
+    // float b, float c) { *d = a; d[1] = c; }, with a #pragma asm block of
+    // one FSCHG above the two stores and one below them. The stores are the
+    // compiler's own, written for C. R10 writes .ALIGN 4 below each block,
+    // which stops the count, and once drop-inline-align drops it the stores
+    // are witnesses that stand on the inline FSCHG, the first the one
+    // inspect reports
+    static const char copied[] =
+        CODE "_pb_store:\n"
+             "          FSCHG\n" ALIGN "          FMOV.S      FR4,@R4\n"
+             "          MOV         #4,R0\n"
+             "          FMOV.S      FR6,@(R0,R4)\n"
+             "L236:\n"
+             "          FSCHG\n" ALIGN S("RTS") S("NOP");
+    static const char dropped[] = CODE "_pb_store:\n"
+                                       "          FSCHG\n"
+                                       "          FMOV.S      FR4,@R4\n"
+                                       "          MOV         #4,R0\n"
+                                       "          FMOV.S      FR6,@(R0,R4)\n"
+                                       "L236:\n"
+                                       "          FSCHG\n" S("RTS") S("NOP");
+    CHECK(rewrites(DROP, copied, dropped));
+    CHECK(inspects_lines(copied, 1, 0, UNKNOWN, "none; assembler-layout 4"));
+    CHECK(inspects_lines(dropped, 1, 0, UNKNOWN, "operand fschg-stores 4"));
+
+    // njMemCopySQ of the R11b ninja.lib member njMem_, cut down to its loop,
+    // as a #pragma asm block builds it, which SHC copies as written: the
+    // stores of DR6 and DR4 to the store queue are witnesses, and so are the
+    // DT below them and the FSCHG in the slot
+    static const char queue[] = F("        FSCHG\n"
+                                  "?loop:\n"
+                                  "        FMOV        @R5+,DR0\n"
+                                  "        FMOV        @R5+,DR2\n"
+                                  "        ADD         #32,R4\n"
+                                  "        FMOV        @R5+,DR4\n"
+                                  "        FMOV        @R5+,DR6\n"
+                                  "        PREF        @R5\n"
+                                  "        FMOV        DR6,@-R4\n"
+                                  "        FMOV        DR4,@-R4\n"
+                                  "        DT          R6\n"
+                                  "        FMOV        DR2,@-R4\n"
+                                  "        FMOV        DR0,@-R4\n"
+                                  "        PREF        @R4\n"
+                                  "        BF/S        ?loop\n"
+                                  "        ADD         #32,R4\n"
+                                  "        RTS\n"
+                                  "        FSCHG\n");
+    CHECK(inspects_all(queue, UNKNOWN,
+                       "operand fschg-stores 10, operand fschg-stores 11, "
+                       "operand fschg-dt 12, operand fschg-slot 19"));
+}
+
+static void test_inspect_register_moves(void)
+{
+    // an FMOV between two FPU registers after an odd number of FSCHGs on
+    // every path from the entry, whatever --sz says: FR, DR and XD registers
+    // in each pairing asmsh takes, with a size and without, in any case, and
+    // in a slot
+    static const struct {
+        const char *in;
+        const char *want;
+    } moves[] = {
+        {F(S("FSCHG") S("FMOV        DR0,XD0") S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-register-moves 3"},
+        {F(S("FSCHG") S("FMOV.S      FR0,FR1") S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-register-moves 3"},
+        {F(S("FSCHG") S("FMOV        FR14,FR12") S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-register-moves 3"},
+        {F(S("FSCHG") S("FMOV.D      DR4,DR2") S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-register-moves 3"},
+        {F(S("FSCHG") S("FMOV        XD0,DR0") S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-register-moves 3"},
+        {F(S("FSCHG") S("FMOV        XD2,XD14") S("FSCHG") S("RTS") S("NOP")),
+         "operand fschg-register-moves 3"},
+        {F(S("fschg") S("fmov        dr0,xd0") S("fschg") S("rts") S("nop")),
+         "operand fschg-register-moves 3"},
+        {F(S("FSCHG") S("RTS") S("FMOV        DR0,XD0")),
+         "operand fschg-register-moves 4"},
+    };
+    static const int szs[] = {UNKNOWN, SHCKIT_SZ_0, SHCKIT_SZ_1};
+    for (size_t i = 0; i < sizeof moves / sizeof moves[0]; i++) {
+        for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
+            CHECK(inspects(moves[i].in, szs[j], moves[i].want));
+        }
+    }
+
+    // each move so, in line order, among the other rules' witnesses:
+    // hand-written assembly, cut down, that builds a unit matrix in XMTRX
+    // from DR0, DR2 and DR4 between two runs of stores, and a move in a run
+    // that closes in the slot of its RTS
+    static const char unit[] = F(
+        S("FLDI1       FR0") S("FLDI0       FR1") S("FLDI0       FR2")
+            S("FLDI1       FR3") S("FLDI0       FR4") S("FLDI0       FR5")
+                S("FSCHG") S("FMOV        XD14,@-R5") S("FMOV        XD0,@-R5")
+                    S("ADD         #64,R4") S("FMOV        DR0,XD0")
+                        S("FMOV        DR4,XD2") S("FMOV        DR2,XD14")
+                            S("FMOV        XD14,@-R4") S("FMOV        XD0,@-R4")
+                                S("FSCHG") S("RTS") S("MOV         #1,R0"));
+    CHECK(inspects_all(unit, UNKNOWN,
+                       "operand fschg-register-moves 12, operand "
+                       "fschg-register-moves 13, operand fschg-register-moves "
+                       "14"));
+    CHECK(inspects_all(
+        F(S("FSCHG") S("FMOV        DR0,XD0") S("RTS") S("FSCHG")), UNKNOWN,
+        "operand fschg-register-moves 3, operand fschg-slot 5"));
+
+    // no witness: C's own copies outside a run, at an even count, one in a
+    // return's slot among them; in a run, the moves through memory and the
+    // other instructions R10 writes there, and an FADD, which one option set
+    // carries into a run; a join whose paths disagree; a write to FPSCR; a
+    // line control never reaches; and one past a call
+    static const struct {
+        const char *in;
+        const char *want;
+    } others[] = {
+        {F(S("FMOV.S      FR4,FR5") S("FSCHG") S("FMOV        @R4+,XD0")
+               S("FSCHG") S("FMOV.S      FR5,FR1") S("RTS")
+                   S("FMOV.S      FR4,FR0")),
+         "none"},
+        {F(S("FSCHG") S("FMOV        @R2+,DR0") S("FMOV        @R2+,DR2")
+               S("FMOV        @R3+,DR4") S("FMOV        @R3+,DR6")
+                   S("FTRV        XMTRX,FV0") S("FIPR        FV4,FV0")
+                       S("ADD         #16,R1") S("FMOV        DR0,@-R1") S(
+                           "FADD        FR7,FR3") S("FSCHG") S("RTS") S("NOP")),
+         "none"},
+        {F(S("TST         R5,R5") S("BT          L1")
+               S("FSCHG") "L1:\n" S("FMOV        DR0,XD0") S("RTS") S("NOP")),
+         "none"},
+        {F(S("FSCHG") S("LDS         R4,FPSCR") S("FMOV        DR0,XD0")
+               S("FSCHG") S("RTS") S("NOP")),
+         "none"},
+        {F(S("FSCHG") S("RTS") S("NOP") S("FMOV        DR0,XD0") S("FSCHG")
+               S("RTS") S("NOP")),
+         "none"},
+        {F(S("FSCHG") S("JSR         @R5") S("NOP") S("FMOV        DR0,XD0")
+               S("FSCHG") S("RTS") S("NOP")),
+         "none; call 3"},
+    };
+    for (size_t i = 0; i < sizeof others / sizeof others[0]; i++) {
+        for (size_t j = 0; j < sizeof szs / sizeof szs[0]; j++) {
+            CHECK(inspects(others[i].in, szs[j], others[i].want));
+        }
+    }
+}
+
+static void test_inspect_register_moves_compiled(void)
+{
+    // what R10 writes for C under -cpu=sh4 -optimize=1 -speed, cut down,
+    // which the rule may not witness: C's own copies of floats stand outside
+    // the builtins' runs. M is float[4][4], and r12 to r15f are FR12 to FR15
+    // by #pragma global_register.
+    static const char *const compiled[] = {
+        // float m_1(M m, float x, float y)
+        // { float t = x; x = y; y = t; _builtin_st_ext(m); return x - y; }
+        "_m_1:\n"
+        "          ADD         #-4,R15\n"
+        "          ADD         #64,R4\n"
+        "          FMOV.S      FR5,@R15\n"
+        "          FMOV.S      FR4,FR5\n"
+        "          FMOV.S      @R15,FR4\n"
+        "          FSCHG\n"
+        "          FMOV        XD14,@-R4\n"
+        "          FMOV        XD0,@-R4\n"
+        "          FSCHG\n"
+        "          FMOV.S      FR4,FR0\n"
+        "          FSUB        FR5,FR0\n"
+        "          RTS\n"
+        "          ADD         #4,R15\n",
+        // void m_5(M m) { float x = r12, y = r13; _builtin_st_ext(m);
+        //   r12 = r14; r13 = r15f; r14 = x; r15f = y; _builtin_ld_ext(m); },
+        // whose copies stand between the close of one run and the open of
+        // the next
+        "_m_5:\n"
+        "          FMOV.S      FR12,FR4\n"
+        "          FMOV.S      FR13,FR5\n"
+        "          MOV         R4,R3\n"
+        "          ADD         #64,R3\n"
+        "          FSCHG\n"
+        "          FMOV        XD14,@-R3\n"
+        "          FMOV        XD0,@-R3\n"
+        "          FSCHG\n"
+        "          FMOV.S      FR14,FR12\n"
+        "          FMOV.S      FR15,FR13\n"
+        "          FMOV.S      FR4,FR14\n"
+        "          FMOV.S      FR5,FR15\n"
+        "          FSCHG\n"
+        "          FMOV        @R4+,XD0\n"
+        "          FMOV        @R4+,XD14\n"
+        "          FSCHG\n"
+        "          RTS\n"
+        "          NOP\n",
+    };
+    for (size_t i = 0; i < sizeof compiled / sizeof compiled[0]; i++) {
+        CHECK(inspects(compiled[i], UNKNOWN, "none"));
+        CHECK(inspects(compiled[i], SHCKIT_SZ_0, "none"));
+    }
+
+    // inline text in front of compiled C: void w_move(void)
+    // { sz_on(); gf12 = gf14; sz_off(); }, sz_on and sz_off #pragma
+    // inline_asm functions of one FSCHG and gf12 and gf14 FR12 and FR14 by
+    // #pragma global_register. The copy is the compiler's own, written for
+    // C. R10 writes .ALIGN 4 below each piece of inline text, which stops
+    // the count, and once drop-inline-align drops it the copy is a witness
+    // that stands on the inline FSCHG
+    static const char copied[] =
+        CODE "_w_move:\n"
+             "          FSCHG\n" ALIGN "          FMOV.S      FR14,FR12\n"
+             "L270:\n"
+             "          FSCHG\n" ALIGN S("RTS") S("NOP");
+    static const char dropped[] = CODE "_w_move:\n"
+                                       "          FSCHG\n"
+                                       "          FMOV.S      FR14,FR12\n"
+                                       "L270:\n"
+                                       "          FSCHG\n" S("RTS") S("NOP");
+    CHECK(rewrites(DROP, copied, dropped));
+    CHECK(inspects_lines(copied, 1, 0, UNKNOWN, "none; assembler-layout 4"));
+    CHECK(inspects_lines(dropped, 1, 0, UNKNOWN,
+                         "operand fschg-register-moves 4"));
+
+    // and float w_store(float *d, float a, float b, float c, float e)
+    // { sz_on(); *d = ...; sz_off(); return a; }, cut down to one product,
+    // in the text drop-inline-align makes of it: the copies from FR15, where
+    // R10 keeps a, are witnesses that stand on the inline FSCHG, and the
+    // store is of FR2, which is no fschg-stores witness
+    static const char stored[] = "_w_store:\n"
+                                 "          FMOV.S      FR15,@-R15\n"
+                                 "          MOV         #4,R0\n"
+                                 "          FMOV.S      FR13,@-R15\n"
+                                 "          FMOV.S      FR4,FR15\n"
+                                 "          ADD         #-12,R15\n"
+                                 "          FMOV.S      FR7,FR13\n"
+                                 "          MOV.L       R4,@(8,R15)\n"
+                                 "          FMOV.S      FR5,@(R0,R15)\n"
+                                 "          FMOV.S      FR6,@R15\n"
+                                 "          FSCHG\n"
+                                 "          MOV.L       @(8,R15),R2\n"
+                                 "          MOV         #4,R0\n"
+                                 "          FMOV.S      @R15,FR1\n"
+                                 "          FMOV.S      FR15,FR0\n"
+                                 "          FMOV.S      @(R0,R15),FR3\n"
+                                 "          FMOV.S      FR15,FR2\n"
+                                 "          FMUL        FR3,FR2\n"
+                                 "          FMOV.S      FR2,@R2\n"
+                                 "L272:\n"
+                                 "          FSCHG\n"
+                                 "          FMOV.S      FR15,FR0\n"
+                                 "          ADD         #12,R15\n"
+                                 "          FMOV.S      @R15+,FR13\n"
+                                 "          RTS\n"
+                                 "          FMOV.S      @R15+,FR15\n";
+    CHECK(inspects_all(stored, UNKNOWN,
+                       "operand fschg-register-moves 15, operand "
+                       "fschg-register-moves 17"));
 }
 
 static void test_inspect_compiled(void)
@@ -6973,16 +9318,30 @@ int main(int argc, char **argv)
     test_apply();
     test_patch_names();
     test_inspect_rules();
+    test_inspect_fipr_unloaded();
+    test_inspect_fipr_unloaded_compiled();
+    test_inspect_fipr_shared();
+    test_inspect_fipr_shared_compiled();
     test_inspect_operands();
     test_inspect_integers();
     test_inspect_labels();
+    test_inspect_slot();
+    test_inspect_slot_compiled();
     test_inspect_stack_written();
     test_inspect_fpscr();
     test_inspect_fpscr_compiled();
+    test_inspect_pr_save();
+    test_inspect_pr_save_compiled();
     test_inspect_stack();
     test_inspect_branches();
     test_inspect_returns();
     test_inspect_pairs();
+    test_inspect_dt();
+    test_inspect_dt_compiled();
+    test_inspect_stores();
+    test_inspect_stores_compiled();
+    test_inspect_register_moves();
+    test_inspect_register_moves_compiled();
     test_inspect_compiled();
     test_inspect_all();
     test_inspect_contracts();
